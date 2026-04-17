@@ -1,0 +1,21 @@
+[project]
+name = "custom-platform-evolve"
+version = "0.1.0"
+description = "Platform-neutral scaffold for AI-agent-driven kernel auto-optimization"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.4.0; sys_platform == 'linux'",
+    "tomli>=2.0.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+

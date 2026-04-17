@@ -1,0 +1,1 @@
+experiment_id	hypothesis	correctness	time_ms	throughput	peak_vram_mb	kept	achieved_compute_tflops	achieved_memory_gbps	peak_compute_tflops	peak_memory_gbps	bottleneck	git_sha	parent_experiment_id	profile_top_stall	profile_occupancy	profile_l1_hit_rate	profile_l2_hit_rate

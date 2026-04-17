@@ -1,0 +1,29 @@
+[meta]
+multi_output = false
+
+test_dtypes = ["float16", "float32"]
+
+[[test_sizes]]
+label = "tiny"
+params = {M = 128, N = 128}
+
+[[test_sizes]]
+label = "small"
+params = {M = 1024, N = 1024}
+
+[[test_sizes]]
+label = "large"
+params = {M = 4096, N = 4096}
+
+[tolerances.float16]
+atol = 1e-2
+rtol = 1e-2
+
+[tolerances.float32]
+atol = 1e-4
+rtol = 1e-4
+
+[[edge_sizes]]
+label = "edge_1023"
+params = {M = 1023, N = 513}
+
