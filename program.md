@@ -149,6 +149,7 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 > Hypothesis: [What you plan to change and why you expect it to improve performance]
 > Macro evidence: [Which `tools/bench.py` metric(s) indicate the bottleneck direction]
 > NCU evidence: [Which ncu-cli finding(s) pinpoint the specific cause]
+> Expected impact: [Estimated dynamic-time coverage and expected end-to-end speedup]
 
 **Hypothesis workflow:**
 1. **Macro**: `tools/bench.py` roofline → is it compute-bound or memory-bound? How far from peak?
@@ -158,12 +159,21 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 5. **Knowledge**: Check `CUDA_OPTIMIZATION.md` → does a known optimization address this? The "Cross-Kernel Optimization Patterns" section at the bottom organizes techniques by bottleneck type (e.g., `[register-pressure]`, `[occupancy]`, `[tensor-core]`) for easy lookup regardless of which kernel you're optimizing.
 6. **Docs**: Read relevant files in `docs/` for the specific bottleneck. The `docs/` directory contains curated references on stall reasons, synchronization, memory optimization, compute optimization, framework-specific tuning, and architecture-specific notes.
 7. **History**: Check `memory/<kernel_type>.md` → has this been tried before for this kernel?
+8. **Impact gate**: estimate the maximum possible end-to-end gain before editing code. Use benchmark shapes, loop trip counts, tile counts, predicate/branch coverage, NCU instruction/stall shares, and prior timing deltas. If the affected dynamic work is a small boundary case or the theoretical end-to-end gain is below the keep threshold, reject the idea before implementation.
+9. **Generality gate**: reject benchmark-shape overfitting before editing code. A proposed optimization must be valid for the operator's intended runtime variability, not just for the current `kernel_configs/` sizes. Do not specialize on runtime-varying dimensions, batch counts, grid sizes, or other benchmark constants unless they are explicitly part of the operator contract or production invariant. Prefer optimizations based on stable facts such as dtype, hardware architecture, fixed layout contracts, fixed semantic dimensions, or runtime tile-state checks that work for arbitrary supported problem sizes.
+10. **History-neighborhood gate**: if a proposed change is an adjacent variant of a negative or rejected strategy (same hot path, same data layout family, same tile sweep, same load/store trick), skip it unless there is new contradictory NCU evidence showing that the bottleneck moved.
+11. **Priority gate**: rank all candidate hypotheses by expected end-to-end impact divided by implementation/validation risk. Spend early iterations on the dominant bottleneck only; leave cleanup and noise-floor micro-tuning for after a structural improvement is working.
 
 **Rules:**
 - One change per experiment. Do not combine unrelated optimizations.
 - If you've tried this before (check per-kernel log), try something different.
 - Read the current scope's `blocked` / `preferred` fingerprints before writing the proposal. Do not repeat blocked strategies unless you have new contradictory evidence.
 - Always ground hypotheses in NCU evidence, not guesswork.
+- Do not spend an iteration on a change whose estimated best-case end-to-end speedup is below the keep threshold, unless the experiment is a minimal correctness probe for a larger structural redesign.
+- Do not design optimizations that only win because the benchmark uses fixed sizes. In particular, do not add compile-time specializations, dispatch branches, hard-coded constants, or removed checks for dimensions/properties that are expected to vary in real use. If a specialization is proposed, the proposal must state why the specialized property is a true API/production invariant rather than a benchmark artifact.
+- For boundary-only changes (tail cases, partial tiles, uncommon predicates, rare dtype/shape paths), compute what fraction of the benchmarked dynamic work they cover. If that fraction is small, deprioritize them behind changes that affect the steady-state hot path.
+- Runtime checks for common tile states are allowed when they preserve correctness and performance portability across all supported sizes. Benchmark-only dispatch is not allowed.
+- Do not turn a structural bottleneck into a series of local layout/load/barrier tweaks. If NCU and history indicate the design itself is wrong, the next experiments must change the design boundary.
 - Never satisfy an optimization task by swapping in a library implementation. Improve the custom kernel code itself.
 
 ### Step 5: Modify

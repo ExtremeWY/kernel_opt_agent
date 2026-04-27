@@ -99,11 +99,42 @@ The repository uses short reusable tags in experiment notes and this guide.
 4. inspect tile shape and data type
 5. inspect registers per thread and achieved occupancy
 6. only then try deeper pipeline, warp specialization, or epilogue fusion
+7. estimate dynamic coverage before selecting an experiment: if the change only
+   affects boundary tiles, tail predicates, diagonal tiles, or rare shape cases,
+   compute the maximum end-to-end speedup and skip it when the estimate is near
+   benchmark noise or below the keep threshold
+8. if the dominant gap is structural, such as low tensor-core utilization on an
+   MMA-friendly compute-bound kernel, prioritize redesigns that move the main
+   FLOPs onto the right pipeline before local layout/load/barrier polishing
 
 Read first:
 
 - `docs/compute_optimization.md`
 - `docs/triton_optimization.md` or `docs/cutlass_optimization.md`
+
+### Experiment Triage Gate
+
+Before writing code, every candidate experiment must answer:
+
+1. What fraction of the primary benchmark's dynamic work does this change touch?
+2. What is the best-case end-to-end speedup if that touched work became free?
+3. Has an adjacent strategy already been negative or rejected in
+   `memory/<kernel_type>.md` or `workspace/strategy_memory/global_strategy_memory.json`?
+4. Does the change attack the primary NCU bottleneck, or only a secondary metric?
+5. Is the expected speedup comfortably above the full-benchmark keep threshold?
+6. Does the change remain valid for the operator's intended runtime variability,
+   or does it only work because the benchmark uses fixed sizes?
+
+Reject the candidate before implementation if the answer is unfavorable. This
+prevents burning iterations on changes that are technically plausible but cannot
+move the benchmark enough to survive the keep/revert rule.
+
+Do not treat fixed benchmark dimensions as optimization invariants. Compile-time
+specializations, dispatch branches, removed checks, or hard-coded constants are
+valid only when the specialized property is part of the operator contract or a
+documented production invariant. Runtime tile-state checks are acceptable when
+they preserve correctness and performance portability across all supported
+problem sizes.
 
 ### Memory-Bound Playbook
 
@@ -414,6 +445,19 @@ Patterns below are indexed by **bottleneck type** rather than kernel. When the a
 - Current instruction path: short-sequence path now uses a partial WMMA score-tile implementation, but tensor-core share is still low (`ncu_tensor_core_pct≈0.4%`)
 - Working set behavior: K/V staging is shared-memory resident; dynamic shared memory per CTA is only `16 KB`
 - Main sensitivity observed so far: CTA geometry, shared-memory layout, and staging instruction count all materially affect performance
+- Current plateau after `run_012`: `large≈3.22-3.25 ms`, `21.2-21.3 TFLOPS`,
+  `compute_bound`, occupancy already high (`≈82.8%`), and tensor-core
+  instruction share still low (`≈2.1%`). The remaining gap is structural:
+  QK score generation and full-tile PV are now partially WMMA, but the path
+  still materializes scores/probabilities through shared memory and leaves
+  boundary/update work outside tensor cores.
+- Source/SASS NCU attribution after `run_014` refined the shared-memory issue:
+  `~68.8%` of attributed excessive shared wavefronts come from PV WMMA
+  matrix-A loads of `prob_tile`, mapping to `kernel.cu:374`; `~22.6%` comes
+  from WMMA accumulator shared stores. K/V staging and scalar probability
+  writes are not conflict sources. Future bank-conflict work must therefore
+  target the PV WMMA-A/probability dataflow or accumulator store/readback path,
+  not K/V pitch or generic shared-memory padding.
 
 ### Effective Optimizations
 
@@ -450,8 +494,49 @@ Patterns below are indexed by **bottleneck type** rather than kernel. When the a
    - Replacing element-wise WMMA tile staging with `uint4` copies improved `large` from `10.46 ms` to `8.15 ms` and `medium` from `2.74 ms` to `2.09 ms`.
    - Why it works: after the WMMA path exists, staging overhead becomes a major secondary cost. Vectorized copies slash address-generation and copy instruction count without changing the numerical path.
 
+9. **Move full-tile PV accumulation to WMMA and reuse score scratch** (`[tensor-core]` `[pv-path]` `[shared-memory]`)
+   - Adding a full-tile PV-WMMA path improved the inherited `large` full benchmark from `5.0569 ms` to `4.3916 ms`, but the naive extra `16x128` float PV scratch cut occupancy to `41.6%`.
+   - Reusing the existing score scratch as two-phase `16x64` PV output scratch restored occupancy to `82.8%` and improved the final full benchmark to `large=3.3257 ms`, `20.67 TFLOPS`.
+   - Why it works: the steady-state full-tile path covers most dynamic work in the benchmarked shape, and scalar owner-warp `P*V` was the next structural bottleneck after QK score WMMA. The scratch-reuse version keeps the tensor-core PV work without paying a shared-memory residency penalty.
+
+10. **Specialize full-prefix K/V staging** (`[full-tile]` `[staging]` `[control-flow]`)
+   - Splitting K/V staging into a branch-free full-prefix path improved `large` from `3.3257 ms` to a best observed `3.2227 ms`; promotion validation measured `3.2473 ms`.
+   - Why it works: benchmarked causal shapes spend most tile iterations in full-prefix tiles where all 64 K/V rows are active. Removing inactive-row checks and zeroing from that hot staging loop trims repeated control/copy overhead without changing the WMMA operand layout.
+
 ### Anti-patterns
 
+- **K/V pitch or generic shared-memory tuning for the current bank-conflict signal** (`[shared-memory]` `[bank-conflict]`)
+  - Source attribution showed K/V full-prefix staging, residual staging, scalar `prob_tile` stores, and `v_tile` WMMA-B loads have actual shared wavefronts equal to ideal or zero excessive wavefronts.
+  - Reason: the aggregate `~169.8M` bank-conflict signal is dominated by PV WMMA-A loads of `prob_tile` and WMMA accumulator stores. K/V layout work does not attack the source-attributed bottleneck.
+- **Direct global WMMA operands for staged K/V in this kernel** (`[memory-access]` `[tensor-core]`)
+  - Loading `V` directly from global/L2 in PV-WMMA regressed to `large=3.55 ms`; loading `K` directly from global/L2 in QK-WMMA regressed to `large=3.87 ms`.
+  - Reason: despite high L2 hit rate, the current WMMA path depends on the staged/padded shared-memory operand layout. Removing staging loses more than it saves.
+- **Late-stage local staging/control variants after full-prefix staging** (`[staging]` `[control-flow]`)
+  - Skipping full-prefix pad-zero stores, branch-free full-query Q staging, and duplicating a larger full-prefix fast block did not improve the primary `large` metric beyond the kept staging split.
+  - Reason: these affect less dynamic work or add enough code/branch pressure to erase the saved instructions.
+- **Adjacent PV-WMMA micro-tweaks after scratch reuse** (`[pv-path]` `[shared-memory]` `[control-flow]`)
+  - Compact `V` pitch, `kWmmaBlockN=128`, explicit phase-loop unroll, diagonal-adjacent PV-WMMA coverage, padded `65`-stride PV scratch, and lane-half phase checks all failed to beat the scratch-reuse PV-WMMA best.
+  - Reason: after the structural PV-WMMA change, the nearby local layout/control variants were either below the full-benchmark keep threshold or added resource/control cost. Future work should change the dataflow boundary again instead of sweeping neighboring forms of the same implementation.
+- **PV-owned accumulation via a larger shared accumulator** (`[pv-path]` `[shared-memory]` `[dataflow]`)
+  - A runtime-general full-prefix shared-accumulator probe passed quick correctness but regressed `large` to `5.0465 ms`.
+  - Reason: moving ownership out of owner warps only helps if the accumulator stays low-overhead. Adding a `16x128` shared accumulator increases shared footprint and shared update traffic enough to overwhelm the saved owner readback. Register-level PV ownership would need a different dataflow because standard WMMA fragment layout is not suitable for row-wise online-softmax scaling.
+- **Probability-subtile streaming with standard WMMA fragments** (`[score-prob]` `[pv-path]` `[tensor-core]`)
+  - A runtime-general `16x16` probability subtile version passed quick correctness but regressed `large` to `5.4388 ms`.
+  - Reason: the standard WMMA implementation requires extra full-block barriers between probability-subtile production and PV consumption, and the two-accumulator-fragment PV path increases register/code pressure. The saved `16x64` probability materialization is not enough to offset those costs.
+- **Boundary-only score/owner tweaks after `run_009`** (`[causal-mask]` `[score-tile]` `[wmma-hotloop]`)
+  - Tail tiles, diagonal-tile cleanups, partial score-warp gating, and similar
+    boundary-only changes affect too little of the `seq_len=2048` primary
+    benchmark to justify early iterations.
+  - Reason: most dynamic work is the steady-state full causal tile path, and the
+    keep threshold is `>1%` on full benchmark. These ideas should be deferred
+    unless NCU shows the boundary path became dominant.
+- **More score-tile layout/load polishing around the materialized score slab** (`[score-tile]` `[shared-memory]`)
+  - Compact score subtiles, score-row load packing, fewer score warps,
+    column-major score layout, and `kWmmaBlockN=48` retuning have already failed
+    or failed to survive full validation in recent runs.
+  - Reason: the bottleneck is the materialized score handoff plus scalar PV, not
+    the exact local representation of the same handoff. Future experiments
+    should reduce/bypass score materialization or move PV to tensor cores.
 - **A single fixed wide CTA shape for every sequence length** (`[occupancy]` `[launch-config]`)
   - Fixed `WARPS_PER_BLOCK=8` improved `medium`/`large`, but regressed `xlarge` badly (`195.59 ms` vs ~`85 ms` baseline-scale).
   - Reason: the wider CTA is beneficial where occupancy is the main limiter, but it over-shoots on larger sequence lengths. Launch geometry should depend on sequence length, not stay globally fixed.
