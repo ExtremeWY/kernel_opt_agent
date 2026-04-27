@@ -25,3 +25,22 @@ assets/*
 
 .ruff_cache/
 .pytest_cache/
+workspace/.torch_extensions/
+workspace/MEMORY.md
+workspace/preflight_check.*
+workspace/results.tsv
+workspace/runtime_env.md
+workspace/runs/*
+!workspace/runs/.gitkeep
+workspace/ncu_reports/*
+!workspace/ncu_reports/.gitkeep
+workspace/strategy_memory/
+custom_platform/workspace/MEMORY.md
+custom_platform/workspace/preflight_check.*
+custom_platform/workspace/results.tsv
+custom_platform/workspace/runtime_env.md
+custom_platform/workspace/runs/*
+!custom_platform/workspace/runs/.gitkeep
+custom_platform/workspace/mock_profile/
+custom_platform/workspace/strategy_memory/
+cuda-optimized-skill/cuda-optimized-skill/
