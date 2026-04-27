@@ -74,6 +74,91 @@ def _error_payload(code: str, stage: str, message: str) -> dict[str, str]:
     return {"code": code, "stage": stage, "message": message}
 
 
+def _has_nan_inf(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(_has_nan_inf(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_has_nan_inf(item) for item in value)
+    if hasattr(value, "is_floating_point"):
+        torch = _import_torch()
+        if value.is_floating_point():
+            return bool(torch.isnan(value).any().item() or torch.isinf(value).any().item())
+        return False
+    if isinstance(value, float):
+        return value != value or value in (float("inf"), float("-inf"))
+    return False
+
+
+def _map_floating_leaves(value: Any, transform: Callable[[Any], Any]) -> Any:
+    if isinstance(value, dict):
+        return {key: _map_floating_leaves(item, transform) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_map_floating_leaves(item, transform) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_map_floating_leaves(item, transform) for item in value)
+    if hasattr(value, "is_floating_point"):
+        return transform(value) if value.is_floating_point() else value
+    if isinstance(value, float):
+        return transform(value)
+    return value
+
+
+def _default_numerical_stability_cases(
+    gen_fn: Callable,
+    size: dict[str, Any],
+    dtype: Any,
+    device: str,
+    seed: int = 42,
+) -> list[tuple[str, dict[str, Any]]]:
+    base_inputs = gen_fn(size, dtype, device, seed=seed)
+    return [
+        ("baseline", base_inputs),
+        ("low_amplitude", _map_floating_leaves(base_inputs, lambda v: v * 0.1)),
+        ("high_amplitude", _map_floating_leaves(base_inputs, lambda v: v * 4.0)),
+        ("all_zeros", _map_floating_leaves(base_inputs, lambda v: v * 0.0)),
+        ("all_same", _map_floating_leaves(base_inputs, lambda v: v * 0.0 + 0.5)),
+    ]
+
+
+def _numerical_stability_cases(
+    config: dict[str, Any],
+    gen_fn: Callable,
+    size: dict[str, Any],
+    dtype: Any,
+    device: str,
+) -> list[tuple[str, dict[str, Any]]]:
+    case_builder = config.get("numerical_stability_cases")
+    if case_builder is not None:
+        return case_builder(size, dtype, device, seed=42)
+    return _default_numerical_stability_cases(gen_fn, size, dtype, device, seed=42)
+
+
+def _prime_kernel(
+    kernel_fn: Callable,
+    config: dict[str, Any],
+    device: str,
+    adapter,
+) -> dict[str, Any]:
+    sizes = config["test_sizes"]
+    dtypes = config["test_dtypes"]
+    if not sizes:
+        raise ValueError("config.test_sizes must not be empty")
+    if not dtypes:
+        raise ValueError("config.test_dtypes must not be empty")
+
+    label, size = sizes[0]
+    dtype = dtypes[0]
+    inputs = config["input_generator"](size, dtype, device, seed=42)
+    t0 = time.time()
+    kernel_fn(**inputs)
+    adapter.synchronize()
+    return {
+        "label": label,
+        "dtype": str(dtype),
+        "elapsed_ms": (time.time() - t0) * 1000.0,
+    }
+
+
 def run_correctness(kernel_fn: Callable, config: dict[str, Any], device: str) -> dict[str, Any]:
     gen_fn = config["input_generator"]
     ref_fn = config["reference_fn"]
@@ -86,11 +171,35 @@ def run_correctness(kernel_fn: Callable, config: dict[str, Any], device: str) ->
     expected = ref_fn(inputs)
     output = kernel_fn(**inputs)
     cmp = _compare(output, expected, tol["atol"], tol["rtol"])
+    smoke_pass = bool(cmp["match"]) and not _has_nan_inf(output)
+
+    stability_pass = True
+    stability_max_abs_error = 0.0
+    details: list[str] = []
+    for case_name, case_inputs in _numerical_stability_cases(config, gen_fn, size, dtype, device):
+        expected_case = ref_fn(case_inputs)
+        output_case = kernel_fn(**case_inputs)
+        if _has_nan_inf(output_case) and not _has_nan_inf(expected_case):
+            stability_pass = False
+            details.append(f"stability {case_name}: NaN/Inf (reference is clean)")
+            continue
+
+        case_cmp = _compare(output_case, expected_case, tol["atol"] * 10.0, tol["rtol"] * 10.0)
+        stability_max_abs_error = max(stability_max_abs_error, float(case_cmp["max_abs_error"]))
+        if not case_cmp["match"]:
+            stability_pass = False
+            details.append(
+                f"stability {case_name}: max_abs_error={case_cmp['max_abs_error']:.6e}"
+            )
+
     return {
         "checked": True,
-        "passed": bool(cmp["match"]),
+        "passed": smoke_pass and stability_pass,
         "label": label,
-        "max_abs_error": cmp["max_abs_error"],
+        "max_abs_error": max(float(cmp["max_abs_error"]), stability_max_abs_error),
+        "smoke_test": "PASS" if smoke_pass else "FAIL",
+        "numerical_stability": "PASS" if stability_pass else "FAIL",
+        "details": details,
     }
 
 
@@ -229,8 +338,17 @@ def main() -> None:
         print(f"peak_compute_tflops: {device_spec.peak_tflops_fp16}")
         print(f"peak_memory_gbps: {device_spec.peak_bandwidth_gb_s}")
 
+        print("\n=== KERNEL PRIME ===")
+        prime = _prime_kernel(kernel_fn, config, device, adapter)
+        print(
+            f"kernel_prime: PASS "
+            f"(size={prime['label']}, dtype={prime['dtype']}, elapsed_ms={prime['elapsed_ms']:.2f})"
+        )
+
         correctness = run_correctness(kernel_fn, config, device)
         print(f"correctness: {'PASS' if correctness['passed'] else 'FAIL'}")
+        print(f"smoke_test: {correctness['smoke_test']}")
+        print(f"numerical_stability: {correctness['numerical_stability']}")
         print(f"max_abs_error: {correctness['max_abs_error']:.6e}")
         if not correctness["passed"]:
             payload = _result_payload(
