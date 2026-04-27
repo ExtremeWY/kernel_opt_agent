@@ -9,6 +9,7 @@ from .rms_norm import rms_norm_ref
 from .swiglu_input_quant import swiglu_input_quant_ref
 from .qkv_part_rope import qkv_part_rope_ref
 from .dsa_forward import dsa_forward_ref
+from .flash_attention_2 import flash_attention_2_ref
 
 __all__ = [
     "matmul_ref",
@@ -16,4 +17,5 @@ __all__ = [
     "swiglu_input_quant_ref",
     "qkv_part_rope_ref",
     "dsa_forward_ref",
+    "flash_attention_2_ref",
 ]

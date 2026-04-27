@@ -32,7 +32,7 @@ Key specifications and quirks for optimization, organized by architecture.
 
 ---
 
-## Ada Lovelace (SM 8.9) — RTX 4090, L40S
+## Ada Lovelace (SM 8.9) — RTX 4090, RTX 4070 Ti Super, L40S
 
 **Compute**:
 - 128 SMs (4090), 142 SMs (L40S)
@@ -47,6 +47,32 @@ Key specifications and quirks for optimization, organized by architecture.
 - Large L2 makes tile ordering less critical than on HBM GPUs
 - GDDR6X has different latency characteristics than HBM
 - Consumer cards: no NVLink, no MIG
+
+### RTX 4070 Ti Super Quick Specs
+
+| Component | RTX 4070 Ti Super | Notes |
+|-----------|-------------------|-------|
+| Compute Capability | 8.9 (`sm_89`) | Ada Lovelace, TSMC 4N 5nm |
+| SMs | 66 | AD103-275 chip, roughly 84% of full AD103 |
+| CUDA Cores | 8,448 | 128 per SM |
+| Tensor Cores | 264 | 4th gen, FP8 support |
+| RT Cores | 66 | 3rd gen |
+| FP16 Tensor Core Dense | 176.5 TFLOPS | Dense tensor-core peak |
+| L2 Cache | 48 MB | Larger than A100's 40 MB |
+| Shared Memory | 128 KB/SM | Max 100 KB user-configurable |
+| Registers | 64K 32-bit/SM | 255 per thread max |
+| Memory | 16 GB GDDR6X | 256-bit interface |
+| Memory Bandwidth | 672 GB/s | 21 Gbps effective |
+| TDP | 285 W | Consumer board power limit |
+| Max Threads/SM | 2,048 | 64 warps |
+| Max Threads/Block | 1,024 | 32 warps |
+| Warp Size | 32 | Unchanged from prior NVIDIA architectures |
+| PCIe | 4.0 x16 | About 31.5 GB/s host link bandwidth |
+
+**Optimization notes**:
+- Relative to H100/A100, the much lower memory bandwidth means bandwidth-bound kernels hit the ridge point sooner.
+- The 48 MB L2 is large for a consumer card and often helps persistent or cache-friendly tiling strategies.
+- Since this is a consumer Ada card, assume no NVLink and no MIG when planning multi-GPU or partitioning workflows.
 
 ---
 
@@ -108,6 +134,7 @@ Key specifications and quirks for optimization, organized by architecture.
 | H800 | Hopper | 132 | 989.5 | 3352 | 80 GB | 50 | ~295 |
 | A100 SXM | Ampere | 108 | 312 | 2039 | 80 GB | 40 | ~153 |
 | 4090 | Ada | 128 | 330 | 1008 | 24 GB | 72 | ~327 |
+| 4070 Ti Super | Ada | 66 | 176.5 | 672 | 16 GB | 48 | ~263 |
 | L40S | Ada | 142 | 362 | 864 | 48 GB | 48 | ~419 |
 | L4 | Ada | 58 | 121 | 300 | 24 GB | 48 | ~403 |
 

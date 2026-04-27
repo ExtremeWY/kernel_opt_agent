@@ -81,6 +81,8 @@ def _build_config(toml_path: pathlib.Path) -> Dict[str, Any]:
     cfg["reference_fn"] = mod.reference_fn
     cfg["flops_fn"] = mod.flops_fn
     cfg["bytes_fn"] = mod.bytes_fn
+    if hasattr(mod, "numerical_stability_cases"):
+        cfg["numerical_stability_cases"] = mod.numerical_stability_cases
 
     return cfg
 

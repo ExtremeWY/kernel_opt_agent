@@ -1,0 +1,20 @@
+[meta]
+multi_output = false
+
+test_dtypes = ["bfloat16"]
+
+[[test_sizes]]
+label = "medium"
+params = {batch = 8, head_num = 8, seq_len = 1024, head_dim = 128}
+
+[[test_sizes]]
+label = "large"
+params = {batch = 8, head_num = 8, seq_len = 2048, head_dim = 128}
+
+[[test_sizes]]
+label = "xlarge"
+params = {batch = 8, head_num = 8, seq_len = 4096, head_dim = 128}
+
+[tolerances.bfloat16]
+atol = 5e-2
+rtol = 5e-2

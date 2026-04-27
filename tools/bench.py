@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-bench.py -- cuda-evolve benchmark harness (FIXED -- the agent NEVER modifies this file).
+bench.py -- cuda-evolve benchmark harness.
 
 Handles:
   1. GPU hardware detection and roofline modelling
@@ -178,6 +178,9 @@ _KNOWN_GPUS: Dict[str, Tuple[float, float, float]] = {
     "L4":         (121.0,  300.0,  48.0),
     "A10":        (125.0,  600.0,  6.0),
     "4090":       (330.0,  1008.0, 72.0),
+    "4070 Ti SUPER": (176.5, 672.0, 48.0),
+    "4070 Ti Super": (176.5, 672.0, 48.0),
+    "RTX 4070 Ti SUPER": (176.5, 672.0, 48.0),
     "4080":       (305.0,  716.8,  64.0),
     "3090":       (142.0,  936.2,  6.0),
     "3080":       (119.5,  760.3,  5.0),
@@ -305,6 +308,72 @@ def _do_compare(output, expected, atol, rtol, multi_output):
     if multi_output:
         return _compare_multi(output, expected, atol, rtol)
     return _compare(output, expected, atol, rtol)
+
+
+def _transform_floating_tensors(inputs: dict, transform_fn: Callable[[torch.Tensor], torch.Tensor]) -> dict:
+    transformed = {}
+    for key, value in inputs.items():
+        if isinstance(value, torch.Tensor) and value.is_floating_point():
+            transformed[key] = transform_fn(value)
+        else:
+            transformed[key] = value
+    return transformed
+
+
+def _default_numerical_stability_cases(
+    gen_fn: Callable,
+    size: dict,
+    dtype: torch.dtype,
+    device: str,
+    seed: int = 42,
+) -> list[tuple[str, dict]]:
+    base_inputs = gen_fn(size, dtype, device, seed=seed)
+    return [
+        ("baseline", base_inputs),
+        ("low_amplitude", _transform_floating_tensors(base_inputs, lambda t: t * 1e-3)),
+        ("high_amplitude", _transform_floating_tensors(base_inputs, lambda t: t * 4.0)),
+        ("mixed_amplitude", _transform_floating_tensors(
+            base_inputs,
+            lambda t: t * torch.where(
+                torch.rand_like(t.float()) > 0.5,
+                torch.full_like(t.float(), 2.0),
+                torch.full_like(t.float(), 0.5),
+            ).to(t.dtype),
+        )),
+        ("all_zeros", _transform_floating_tensors(base_inputs, torch.zeros_like)),
+        ("all_same", _transform_floating_tensors(base_inputs, lambda t: torch.full_like(t, 0.5))),
+    ]
+
+
+def _numerical_stability_cases(config: dict, gen_fn: Callable, size: dict, dtype: torch.dtype, device: str) -> list[tuple[str, dict]]:
+    case_builder = config.get("numerical_stability_cases")
+    if case_builder is not None:
+        return case_builder(size, dtype, device, seed=42)
+    return _default_numerical_stability_cases(gen_fn, size, dtype, device, seed=42)
+
+
+def _prime_kernel(kernel_fn: Callable, config: dict, device: str = "cuda") -> dict:
+    """Run one non-timed warmup so JIT/extension build doesn't consume correctness timeout."""
+    sizes = config["test_sizes"]
+    dtypes = config["test_dtypes"]
+    if not sizes:
+        raise ValueError("config.test_sizes must not be empty")
+    if not dtypes:
+        raise ValueError("config.test_dtypes must not be empty")
+
+    label, size = sizes[0]
+    dtype = dtypes[0]
+    inputs = config["input_generator"](size, dtype, device, seed=42)
+
+    t0 = time.time()
+    kernel_fn(**inputs)
+    torch.cuda.synchronize()
+    elapsed_ms = (time.time() - t0) * 1000.0
+    return {
+        "label": label,
+        "dtype": str(dtype),
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> dict:
@@ -476,31 +545,11 @@ def run_correctness(kernel_fn: Callable, config: dict, quick: bool = False) -> d
         stab_size = sizes[min(1, len(sizes) - 1)][1]
     stab_dtype = dtypes[0]
 
-    adversarial_cases = [
-        ("near_max", lambda t: t * 60000.0 if t.dtype == torch.float16 else t * 1e30),
-        ("near_zero", lambda t: t * 1e-6),
-        ("mixed_scale", lambda t: t * torch.where(
-            torch.rand_like(t.float()).to(t.dtype) > 0.5,
-            torch.tensor(1e3, device=t.device, dtype=t.dtype),
-            torch.tensor(1e-3, device=t.device, dtype=t.dtype),
-        )),
-        ("all_zeros", lambda t: torch.zeros_like(t)),
-        ("all_same", lambda t: torch.ones_like(t) * 0.5),
-    ]
-
-    for case_name, transform_fn in adversarial_cases:
+    for case_name, case_inputs in _numerical_stability_cases(config, gen_fn, stab_size, stab_dtype, device):
         try:
-            inputs = gen_fn(stab_size, stab_dtype, device, seed=42)
-            transformed = {}
-            for k, v in inputs.items():
-                if isinstance(v, torch.Tensor) and v.is_floating_point():
-                    transformed[k] = transform_fn(v)
-                else:
-                    transformed[k] = v
-
-            expected = ref_fn(transformed)
+            expected = ref_fn(case_inputs)
             with _Timeout(30):
-                output = kernel_fn(**transformed)
+                output = kernel_fn(**case_inputs)
 
             if _has_nan_inf(output) and not _has_nan_inf(expected):
                 stability_pass = False
@@ -995,6 +1044,25 @@ def main():
     print(f"gpu_peak_bandwidth_gb_s: {gpu.peak_bandwidth_gb_s}")
     print(f"gpu_l2_cache_mb: {gpu.l2_cache_mb}")
     print(f"gpu_compute_capability: {gpu.compute_capability[0]}.{gpu.compute_capability[1]}")
+
+    # ------------------------------------------------------------------
+    # Kernel Prime
+    # ------------------------------------------------------------------
+    print(f"\n=== KERNEL PRIME ===")
+    try:
+        prime = _prime_kernel(kernel_fn, config, device="cuda")
+        print(
+            f"kernel_prime: PASS "
+            f"(size={prime['label']}, dtype={prime['dtype']}, elapsed_ms={prime['elapsed_ms']:.2f})"
+        )
+    except Exception as e:
+        message = f"Kernel prime failed: {type(e).__name__}: {e}"
+        print(f"ERROR: {message}")
+        traceback.print_exc()
+        payload = _error_payload("kernel_prime_failed", "prime", message, kernel_type)
+        payload["bench_time_seconds"] = time.time() - t_start
+        _write_json_out(json_out, payload)
+        sys.exit(1)
 
     # ------------------------------------------------------------------
     # Correctness

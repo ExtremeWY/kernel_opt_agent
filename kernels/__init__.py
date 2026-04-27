@@ -20,4 +20,5 @@ AVAILABLE_KERNELS: list[str] = [
     # Add your kernel names here, e.g.:
     # "rms_norm",
     # "matmul",
+    "flash_attention_2",
 ]

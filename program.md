@@ -26,6 +26,15 @@ Each kernel module (`.py`) must export:
 - `get_flops() -> int` (for roofline analysis)
 - `get_bytes() -> int` (for roofline analysis)
 
+## Non-Negotiable Constraint
+
+All kernel optimization work must optimize the custom kernel implementation itself.
+
+- Do **not** replace the kernel with library calls such as PyTorch SDPA, cuDNN attention, cuBLAS, CUTLASS wrappers, Triton reference kernels, or any other prebuilt fused operator.
+- Do **not** add runtime dispatch that routes “fast” cases to library functions and leaves only fallback cases on the custom kernel.
+- Benchmark results only count if the measured path executes the optimized `kernel.py` / `kernel.cu` implementation directly.
+- Library code may be used only for **reference correctness** and **performance comparison**, never as the optimized solution.
+
 **Kernel types:**
 - **Triton kernels**: Single `.py` file containing Triton code directly
 - **CUDA C kernels**: A `.py` wrapper that compiles and loads a companion `.cu` file via `torch.utils.cpp_extension.load_inline()`
@@ -150,6 +159,7 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 - If you've tried this before (check per-kernel log), try something different.
 - Read the current scope's `blocked` / `preferred` fingerprints before writing the proposal. Do not repeat blocked strategies unless you have new contradictory evidence.
 - Always ground hypotheses in NCU evidence, not guesswork.
+- Never satisfy an optimization task by swapping in a library implementation. Improve the custom kernel code itself.
 
 ### Step 5: Modify
 
