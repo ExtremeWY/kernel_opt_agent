@@ -38,6 +38,8 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
     correctness = bench.get("correctness") or {}
     strategy = record.get("strategy") or {}
     constraints = strategy.get("constraints") or {}
+    guidance = record.get("guidance") or {}
+    kernel_traits = guidance.get("kernel_traits") or {}
     lines = [
         f"# Iteration v{record.get('iteration')}",
         "",
@@ -57,6 +59,22 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
         f"- reason: {strategy.get('reason') or 'not_available'}",
         f"- blocked fingerprints: {', '.join(constraints.get('blocked') or []) or 'none'}",
         f"- preferred fingerprints: {', '.join(constraints.get('preferred') or []) or 'none'}",
+        "",
+        "## Guidance",
+        f"- guidance class: {guidance.get('guidance_class', 'none')}",
+        f"- shape regime: {guidance.get('shape_regime', 'unknown')}",
+        f"- ncu profile status: {(record.get('ncu_metrics') or {}).get('ncu_profile_status', 'unknown')}",
+        f"- requested ncu skills: {(record.get('ncu_metrics') or {}).get('ncu_requested_skills', 'unknown')}",
+        f"- tensor-core pct: {(record.get('ncu_metrics') or {}).get('ncu_tensor_core_pct', 'unknown')}",
+        f"- tensor-core recommendation: {guidance.get('tensor_core_recommendation', 'unknown')}",
+        f"- reasoning: {guidance.get('tensor_core_reasoning', '')}",
+        f"- is matmul-like: {kernel_traits.get('is_matmul_like', 'unknown')}",
+        f"- mma shape risk: {kernel_traits.get('mma_shape_risk', 'unknown')}",
+        f"- small-M risk: {kernel_traits.get('small_m_risk', 'unknown')}",
+        f"- decode-like risk: {kernel_traits.get('decode_like_risk', 'unknown')}",
+        f"- mma M fill ratio: {kernel_traits.get('mma_m_fill_ratio', 'n/a')}",
+        f"- padding overhead ratio: {kernel_traits.get('padding_overhead_ratio', 'n/a')}",
+        f"- next steps: {' | '.join(guidance.get('next_steps') or []) or 'none'}",
         "",
         "## Commands",
         f"- benchmark: `{record.get('benchmark_command', '')}`",
@@ -104,16 +122,17 @@ def render_final_summary(manifest: dict[str, Any]) -> str:
         "",
         "## Iterations",
         "",
-        "| Iter | Outcome | Correctness | Kernel median ms | Full NCU | Snapshot |",
-        "| --- | --- | --- | ---: | --- | --- |",
+        "| Iter | Outcome | Correctness | Kernel median ms | Guidance | Full NCU | Snapshot |",
+        "| --- | --- | --- | ---: | --- | --- | --- |",
     ]
     for item in manifest.get("iterations", []):
         bench = item.get("benchmark_result") or {}
         correctness = bench.get("correctness") or {}
         kernel = bench.get("kernel") or {}
         strategy = item.get("strategy") or {}
+        guidance = item.get("guidance") or {}
         lines.append(
-            f"| v{item.get('iteration')} | {strategy.get('outcome', 'pending')} | {correctness.get('passed')} | {kernel.get('median_ms', '-')} | {'yes' if item.get('full_report_exists') else 'no'} | {item.get('snapshot_file', '-')} |"
+            f"| v{item.get('iteration')} | {strategy.get('outcome', 'pending')} | {correctness.get('passed')} | {kernel.get('median_ms', '-')} | {guidance.get('tensor_core_recommendation', '-')} | {'yes' if item.get('full_report_exists') else 'no'} | {item.get('snapshot_file', '-')} |"
         )
     best = manifest.get("best_iteration")
     lines.extend(["", "## Best"])

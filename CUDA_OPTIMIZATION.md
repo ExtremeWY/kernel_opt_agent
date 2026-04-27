@@ -33,7 +33,7 @@ This file should stay compact and navigable. Long-form explanations belong in
 
 | Bottleneck or symptom | Primary docs | Typical strategy tags |
 |---|---|---|
-| compute-bound GEMM / tensor-core issues | `docs/compute_optimization.md`, `docs/triton_optimization.md`, `docs/cutlass_optimization.md` | `[tensor-core]`, `[tile-size]`, `[data-type]` |
+| compute-bound GEMM / tensor-core issues | `docs/compute_optimization.md`, `docs/triton_optimization.md`, `docs/cutlass_optimization.md` | `[tensor-core]`, `[mma-shape]`, `[small-m]`, `[compare-cuda-vs-tc]`, `[tile-size]`, `[data-type]` |
 | memory-bound streaming kernel | `docs/memory_optimization.md`, `docs/stall_reasons.md` | `[memory-coalescing]`, `[vectorized-loads]`, `[cache]` |
 | low occupancy | `docs/compute_optimization.md`, `docs/triton_optimization.md` | `[occupancy]`, `[register-pressure]`, `[launch-config]` |
 | high register count / spills | `docs/compute_optimization.md`, `docs/triton_optimization.md` | `[register-pressure]`, `[tile-size]` |
@@ -69,7 +69,10 @@ The repository uses short reusable tags in experiment notes and this guide.
 
 | Tag | Meaning | Go read first |
 |---|---|---|
-| `[tensor-core]` | tensor-core enablement or utilization | `docs/compute_optimization.md` |
+| `[tensor-core]` | tensor-core enablement or utilization for matmul-like, MMA-friendly regimes | `docs/compute_optimization.md` |
+| `[mma-shape]` | MMA tile fill, padding overhead, and tensor-core shape suitability | `docs/compute_optimization.md`, `docs/arch_notes.md` |
+| `[small-m]` | small-M regimes where MMA tile fill is poor | `docs/compute_optimization.md` |
+| `[compare-cuda-vs-tc]` | explicit comparison of CUDA-core and tensor-core-with-padding paths | `docs/compute_optimization.md` |
 | `[register-pressure]` | registers per thread, spills, occupancy limit | `docs/compute_optimization.md` |
 | `[occupancy]` | active warps / blocks per SM | `docs/compute_optimization.md` |
 | `[tile-size]` | tile shape, block geometry, MMA decomposition | `docs/triton_optimization.md`, `docs/cutlass_optimization.md` |
@@ -90,10 +93,12 @@ The repository uses short reusable tags in experiment notes and this guide.
 
 ### Compute-Bound Playbook
 
-1. confirm tensor-core path
-2. inspect tile shape and data type
-3. inspect registers per thread and achieved occupancy
-4. only then try deeper pipeline, warp specialization, or epilogue fusion
+1. confirm whether the kernel is actually matmul / MMA-like
+2. check whether the active shape regime is MMA-friendly or small-M / decode-like
+3. only then inspect tensor-core path and tensor-core instruction share
+4. inspect tile shape and data type
+5. inspect registers per thread and achieved occupancy
+6. only then try deeper pipeline, warp specialization, or epilogue fusion
 
 Read first:
 

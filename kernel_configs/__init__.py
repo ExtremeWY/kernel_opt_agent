@@ -1,6 +1,6 @@
 """Auto-discovery registry for kernel benchmark configurations.
 
-Scans this directory for ``*.toml`` files.  For each file the registry:
+Scans this directory for ``*.toml`` files. For each file the registry:
 1. Parses the TOML data (sizes, dtypes, tolerances, edge_sizes, meta flags).
 2. Imports the companion ``.py`` module with the same stem name to obtain the
    four required callables: ``input_generator``, ``reference_fn``, ``flops_fn``,
@@ -36,6 +36,7 @@ def _parse_sizes(raw: list[dict]) -> list[tuple[str, dict]]:
 
 def _parse_dtypes(raw: list[str]):
     import torch
+
     out: list[torch.dtype] = []
     for name in raw:
         if name not in DTYPE_MAP:
@@ -46,6 +47,7 @@ def _parse_dtypes(raw: list[str]):
 
 def _parse_tolerances(raw: dict):
     import torch
+
     out: dict[torch.dtype, dict[str, float]] = {}
     for name, tol in raw.items():
         dt = DTYPE_MAP.get(name)
@@ -67,6 +69,7 @@ def _build_config(toml_path: pathlib.Path) -> Dict[str, Any]:
     if meta.get("multi_output", False):
         cfg["multi_output"] = True
 
+    cfg["meta"] = meta
     cfg["test_sizes"] = _parse_sizes(data["test_sizes"])
     raw_dtypes = data.get("test_dtypes", meta.get("test_dtypes"))
     if raw_dtypes is None:
@@ -83,6 +86,10 @@ def _build_config(toml_path: pathlib.Path) -> Dict[str, Any]:
     cfg["bytes_fn"] = mod.bytes_fn
     if hasattr(mod, "numerical_stability_cases"):
         cfg["numerical_stability_cases"] = mod.numerical_stability_cases
+    if hasattr(mod, "optimization_traits"):
+        cfg["optimization_traits"] = mod.optimization_traits
+    if hasattr(mod, "KERNEL_OPT_CHARACTERISTICS"):
+        cfg["kernel_opt_characteristics"] = getattr(mod, "KERNEL_OPT_CHARACTERISTICS")
 
     return cfg
 

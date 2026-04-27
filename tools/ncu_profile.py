@@ -13,15 +13,25 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from kernel_configs import KERNEL_CONFIGS
 
 try:
+    from .compute_traits import compute_kernel_traits, load_kernel_type_from_file, parse_metric_percent, select_primary_size
     from .runtime import build_python_cmd
 except ImportError:
+    from compute_traits import compute_kernel_traits, load_kernel_type_from_file, parse_metric_percent, select_primary_size
     from runtime import build_python_cmd
 
 
@@ -74,6 +84,10 @@ SKILL_METRICS: dict[str, list[str]] = {
         "launch__occupancy_limit_blocks",
         "launch__waves_per_multiprocessor",
     ],
+    "tensor_core": [
+        "sm__inst_executed.sum",
+        "sm__inst_executed_pipe_tensor.sum",
+    ],
     "instruction": [
         "sm__inst_executed.sum",
         "sm__inst_executed_pipe_tensor.sum",
@@ -86,7 +100,7 @@ SKILL_METRICS: dict[str, list[str]] = {
 }
 
 ALL_SKILLS = list(SKILL_METRICS.keys())
-TARGETED_SKILLS = ["roofline", "memory", "warp_stall", "occupancy"]
+TARGETED_SKILLS = ["roofline", "memory", "warp_stall", "occupancy", "tensor_core"]
 STALL_METRIC_PREFIX = "smsp__warps_issue_stalled_"
 
 
@@ -109,6 +123,16 @@ def collect_metrics(skills: list[str]) -> list[str]:
     for skill in skills:
         metrics.extend(SKILL_METRICS.get(skill, []))
     return sorted(set(metrics))
+
+
+def resolve_skills(mode: str, skills_arg: str | None, replace_skills: bool) -> list[str]:
+    base = list(TARGETED_SKILLS if mode == "targeted" else ALL_SKILLS)
+    if not skills_arg:
+        return base
+    explicit = [s.strip() for s in skills_arg.split(",") if s.strip()]
+    if replace_skills:
+        return explicit
+    return sorted(set(base + explicit))
 
 
 def _get_kernel_launch_cmd(kernel_file: str, gpu: int = 0) -> list[str]:
@@ -178,7 +202,7 @@ def build_ncu_cmd(
     if metrics:
         cmd += ["--metrics", ",".join(metrics)]
     if rep_out:
-        cmd += ["-o", rep_out]
+        cmd += ["-f", "-o", rep_out]
     if extra_args:
         cmd += extra_args
     cmd += _get_kernel_launch_cmd(kernel_file, gpu=gpu)
@@ -221,7 +245,15 @@ def parse_ncu_csv(csv_path: str) -> list[dict[str, str]]:
     return rows
 
 
-def analyze_rows(rows: list[dict[str, str]]) -> dict[str, str]:
+def analyze_rows(
+    rows: list[dict[str, str]],
+    *,
+    kernel_type: str = "",
+    config: dict[str, Any] | None = None,
+    size: dict[str, Any] | None = None,
+    dtype: Any = None,
+    bench_metrics: dict[str, Any] | None = None,
+) -> dict[str, str]:
     results: dict[str, str] = {}
     metric_vals: dict[str, float] = {}
 
@@ -304,6 +336,29 @@ def analyze_rows(rows: list[dict[str, str]]) -> dict[str, str]:
     if ipc is not None:
         results["ncu_ipc"] = f"{ipc:.2f}"
 
+    traits = compute_kernel_traits(
+        kernel_type,
+        config or {},
+        size or {},
+        dtype=dtype,
+        bench_metrics=bench_metrics,
+        ncu_metrics=results,
+    )
+    results["ncu_is_matmul_like"] = str(traits["is_matmul_like"]).lower()
+    results["ncu_supports_tensor_core_candidate"] = str(traits["supports_tensor_core_candidate"]).lower()
+    results["ncu_mma_shape_risk"] = str(traits["mma_shape_risk"])
+    results["ncu_small_m_risk"] = str(traits["small_m_risk"]).lower()
+    results["ncu_decode_like_risk"] = str(traits["decode_like_risk"]).lower()
+    results["ncu_shape_regime"] = str(traits["shape_regime"])
+    if traits.get("effective_m") is not None:
+        results["ncu_effective_m"] = str(traits["effective_m"])
+    if traits.get("mma_m_fill_ratio") is not None:
+        results["ncu_mma_m_fill_ratio"] = f"{traits['mma_m_fill_ratio']:.2f}"
+    if traits.get("padding_overhead_ratio") is not None:
+        results["ncu_padding_overhead_ratio"] = f"{traits['padding_overhead_ratio']:.2f}"
+    results["ncu_tensor_core_recommendation"] = str(traits["tensor_core_recommendation"])
+    results["ncu_tensor_core_reasoning"] = str(traits["tensor_core_reasoning"])
+
     findings: list[str] = []
     actions: list[str] = []
     if stalls and stalls[0][1] > 0.3:
@@ -319,10 +374,28 @@ def analyze_rows(rows: list[dict[str, str]]) -> dict[str, str]:
             actions.append("Reduce outstanding memory ops or increase compute per byte")
         elif top_stall == "math_pipe_throttle":
             findings.append("High math pipe throttle: compute pipeline saturated")
-            actions.append("Look for tensor-core use, fusion, or algorithmic simplification")
+            recommendation = traits["tensor_core_recommendation"]
+            if recommendation == "recommended":
+                actions.append("Tensor-core/MMA rewrite is justified here: prioritize MMA-friendly tile mapping, tensor-core instructions, and tile shapes that preserve occupancy")
+            elif recommendation == "compare_first":
+                actions.append("This shape regime is a weak MMA fit: compare a CUDA-core path against a tensor-core path with padding/packing before prioritizing tensor cores")
+            elif recommendation == "needs_ncu_evidence":
+                actions.append("The kernel shape looks MMA-friendly, but bench-only evidence is insufficient; confirm low tensor-core instruction share with NCU before prioritizing tensor cores")
+            else:
+                actions.append("Do not assume tensor cores are the answer here; focus on algorithmic simplification, warp-level compute, instruction mix, or register-pressure reduction")
         elif top_stall == "short_scoreboard":
             findings.append("High short scoreboard stalls: shared memory / L1 latency")
             actions.append("Check bank conflicts and shared-memory access density")
+
+    if traits["tensor_core_recommendation"] == "compare_first":
+        findings.append("MMA shape risk is elevated for this matmul-like kernel")
+        actions.append("Benchmark both CUDA-core and tensor-core-with-padding variants; use measured throughput, occupancy, and tensor-core pct to decide")
+    elif traits["tensor_core_recommendation"] == "recommended" and parse_metric_percent(results.get("ncu_tensor_core_pct")) is not None:
+        findings.append("Matmul-like kernel appears shape-friendly for MMA")
+        actions.append("Treat tensor-core enablement as a high-priority structural experiment only after preserving tile fill ratio and launch efficiency")
+    elif not traits["is_matmul_like"]:
+        findings.append("Kernel does not appear matmul-like")
+        actions.append("Prefer compute-path improvements such as loop simplification, warp-level collectives, instruction-mix cleanup, and lower register pressure")
 
     if occ is not None and occ < 50:
         findings.append(f"Low occupancy ({occ:.0f}%)")
@@ -354,11 +427,17 @@ def format_analysis_text(results: dict[str, str], title: str) -> str:
 
 def write_summary_and_details(results: dict[str, str], summary_out: str | None, details_out: str | None) -> None:
     summary_lines = [
+        f"ncu_profile_status: {results.get('ncu_profile_status', '')}",
+        f"ncu_requested_skills: {results.get('ncu_requested_skills', '')}",
         f"ncu_bottleneck: {results.get('ncu_bottleneck', '')}",
         f"ncu_top_stall: {results.get('ncu_top_stall', '')}",
         f"ncu_occupancy: {results.get('ncu_occupancy', '')}",
         f"ncu_l1_hit_rate: {results.get('ncu_l1_hit_rate', '')}",
         f"ncu_l2_hit_rate: {results.get('ncu_l2_hit_rate', '')}",
+        f"ncu_tensor_core_pct: {results.get('ncu_tensor_core_pct', '')}",
+        f"ncu_tensor_core_recommendation: {results.get('ncu_tensor_core_recommendation', '')}",
+        f"ncu_shape_regime: {results.get('ncu_shape_regime', '')}",
+        f"ncu_tensor_core_reasoning: {results.get('ncu_tensor_core_reasoning', '')}",
     ]
     details_text = format_analysis_text(results, "NCU ANALYSIS")
     if summary_out:
@@ -380,6 +459,10 @@ def run_profile_mode(
     stderr_out: str | None,
     summary_out: str | None,
     details_out: str | None,
+    kernel_type: str = "",
+    size: dict[str, Any] | None = None,
+    dtype: Any = None,
+    bench_metrics: dict[str, Any] | None = None,
 ) -> int:
     metrics = collect_metrics(skills)
     csv_path = f"{output_prefix}.csv"
@@ -404,8 +487,28 @@ def run_profile_mode(
         return result.returncode
     rows = parse_ncu_csv(csv_path)
     print(f"ncu_parsed_rows: {len(rows)}")
-    analysis = analyze_rows(rows)
+    resolved_kernel_type = kernel_type or load_kernel_type_from_file(kernel_file)
+    resolved_config = KERNEL_CONFIGS.get(resolved_kernel_type, {})
+    _, default_size = select_primary_size(resolved_config) if resolved_config else ("", {})
+    resolved_size = size or default_size
+    resolved_dtype = dtype if dtype is not None else ((resolved_config.get("test_dtypes") or [None])[0] if resolved_config else None)
+    analysis = analyze_rows(
+        rows,
+        kernel_type=resolved_kernel_type,
+        config=resolved_config,
+        size=resolved_size,
+        dtype=resolved_dtype,
+        bench_metrics=bench_metrics,
+    )
     analysis["ncu_mode"] = mode
+    analysis["ncu_requested_skills"] = ",".join(skills)
+    if mode == "targeted":
+        missing_skills = [skill for skill in TARGETED_SKILLS if skill not in skills]
+        analysis["ncu_profile_status"] = (
+            "complete" if not missing_skills else f"incomplete_missing_skills:{','.join(missing_skills)}"
+        )
+    else:
+        analysis["ncu_profile_status"] = "complete"
     analysis["ncu_csv"] = csv_path
     analysis["ncu_report_path"] = rep_path
     write_summary_and_details(analysis, summary_out, details_out)
@@ -487,8 +590,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="NCU profiling wrapper for cuda-evolve")
     parser.add_argument("--mode", choices=["targeted", "full", "import"], default="targeted")
     parser.add_argument("--skills", type=str, default=None)
+    parser.add_argument(
+        "--replace-skills",
+        action="store_true",
+        help="Replace the default skill set instead of extending it. In targeted mode, omitting this preserves required evidence such as occupancy and tensor_core.",
+    )
     parser.add_argument("--diff", nargs=2, metavar=("BEFORE", "AFTER"))
     parser.add_argument("--kernel-file", type=str, default="kernel.py")
+    parser.add_argument("--kernel-type", type=str, default="")
+    parser.add_argument("--size-json", type=str, default="")
+    parser.add_argument("--dtype", type=str, default="")
+    parser.add_argument("--bench-metrics-json", type=str, default="")
     parser.add_argument("--rep-file", type=str, default=None)
     parser.add_argument("--output-prefix", type=str, default="./workspace/ncu_reports/ncu_profile")
     parser.add_argument("--summary-out", type=str, default=None)
@@ -529,12 +641,27 @@ def main() -> None:
         print(f"ERROR: kernel file not found: {kernel_file}")
         sys.exit(1)
 
-    if args.skills:
-        skills = [s.strip() for s in args.skills.split(",") if s.strip()]
-    elif args.mode == "targeted":
-        skills = TARGETED_SKILLS
-    else:
-        skills = ALL_SKILLS
+    size = {}
+    if args.size_json:
+        try:
+            size = json.loads(args.size_json)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: invalid --size-json: {exc}")
+            sys.exit(1)
+    bench_metrics = {}
+    if args.bench_metrics_json:
+        try:
+            bench_metrics = json.loads(args.bench_metrics_json)
+        except json.JSONDecodeError as exc:
+            print(f"ERROR: invalid --bench-metrics-json: {exc}")
+            sys.exit(1)
+    kernel_type = args.kernel_type or load_kernel_type_from_file(kernel_file)
+    resolved_config = KERNEL_CONFIGS.get(kernel_type, {})
+    if not size and resolved_config:
+        _, size = select_primary_size(resolved_config)
+    dtype = args.dtype or ((resolved_config.get("test_dtypes") or [""])[0] if resolved_config else "")
+
+    skills = resolve_skills(args.mode, args.skills, args.replace_skills)
 
     invalid = [skill for skill in skills if skill not in SKILL_METRICS]
     if invalid:
@@ -556,6 +683,10 @@ def main() -> None:
         stderr_out=args.stderr_out,
         summary_out=args.summary_out,
         details_out=args.details_out,
+        kernel_type=kernel_type,
+        size=size,
+        dtype=dtype,
+        bench_metrics=bench_metrics,
     )
     sys.exit(rc)
 

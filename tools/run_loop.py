@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .compute_traits import compute_kernel_traits
     from .iteration_report import (
         choose_best_iteration,
         load_manifest,
@@ -35,6 +36,7 @@ try:
         update_memory_bucket,
     )
 except ImportError:
+    from compute_traits import compute_kernel_traits
     from iteration_report import choose_best_iteration, load_manifest, render_final_summary, render_iteration_markdown, save_manifest
     from preflight import collect_preflight, write_preflight_outputs
     from runtime import build_python_cmd
@@ -174,6 +176,11 @@ def _run_ncu_mode(
     mode: str,
     gpu: int,
     output_name: str,
+    *,
+    kernel_type: str,
+    size: dict[str, Any] | None,
+    dtype: Any,
+    bench_metrics: dict[str, Any] | None,
 ) -> tuple[int, dict[str, str]]:
     prefix = iter_dir / output_name
     summary_path = iter_dir / f"{output_name}_summary.txt"
@@ -199,6 +206,14 @@ def _run_ncu_mode(
         "--stderr-out",
         str(stderr_path),
     )
+    if kernel_type:
+        cmd.extend(["--kernel-type", kernel_type])
+    if dtype is not None:
+        cmd.extend(["--dtype", str(dtype)])
+    if size:
+        cmd.extend(["--size-json", json.dumps(size, ensure_ascii=False, separators=(",", ":"))])
+    if bench_metrics:
+        cmd.extend(["--bench-metrics-json", json.dumps(bench_metrics, ensure_ascii=False, separators=(",", ":"))])
     result = _run(cmd, timeout=1800)
     metadata = {
         "command": " ".join(cmd),
@@ -327,6 +342,70 @@ def _decide_keep(record: dict[str, Any], parent_id: str) -> tuple[bool, str]:
     return True, "baseline_seed"
 
 
+def _synthesize_guidance(kernel_type: str, benchmark_result: dict[str, Any], ncu_metrics: dict[str, str]) -> dict[str, Any]:
+    bench_traits = benchmark_result.get("compute_traits") or {}
+    primary_size = benchmark_result.get("primary_size") or {}
+    bench_metrics = {
+        "bottleneck": benchmark_result.get("bottleneck", ""),
+        "pct_peak_compute": benchmark_result.get("pct_peak_compute", 0.0),
+        "pct_peak_bandwidth": benchmark_result.get("pct_peak_bandwidth", 0.0),
+    }
+    merged_traits = dict(bench_traits)
+    merged_traits.update(
+        compute_kernel_traits(
+            kernel_type,
+            {},
+            primary_size,
+            dtype=None,
+            bench_metrics=bench_metrics,
+            ncu_metrics=ncu_metrics,
+        )
+    )
+
+    recommendation = merged_traits.get("tensor_core_recommendation", "avoid")
+    if recommendation == "recommended":
+        guidance_class = "major_redesign_candidate"
+        next_steps = [
+            "Prioritize an MMA/tensor-core structural experiment.",
+            "Preserve MMA-friendly tile fill and launch shape while increasing tensor-core instruction share.",
+        ]
+    elif recommendation == "compare_first":
+        guidance_class = "compare_cuda_vs_tc"
+        next_steps = [
+            "Run an explicit A/B experiment: CUDA-core path vs tensor-core path with padding or packing.",
+            "Use measured throughput, occupancy, and tensor-core pct to decide which path to pursue.",
+        ]
+    elif recommendation == "needs_ncu_evidence":
+        guidance_class = "needs_ncu_evidence"
+        next_steps = [
+            "Collect targeted NCU evidence before escalating to a tensor-core redesign.",
+            "If tensor-core instruction share is low under an MMA-friendly shape, upgrade this path to a high-priority experiment.",
+        ]
+    else:
+        guidance_class = "general_compute_path"
+        next_steps = [
+            "Do not force a tensor-core rewrite from low tensor_core_pct alone.",
+            "Focus on algorithmic simplification, warp-level compute, instruction mix, launch shape, or register pressure.",
+        ]
+
+    summary = {
+        "guidance_class": guidance_class,
+        "shape_regime": merged_traits.get("shape_regime", "generic"),
+        "tensor_core_recommendation": recommendation,
+        "tensor_core_reasoning": merged_traits.get("tensor_core_reasoning", ""),
+        "next_steps": next_steps,
+        "kernel_traits": merged_traits,
+    }
+    analysis = {
+        "kernel_type": kernel_type,
+        "bench_bottleneck": benchmark_result.get("bottleneck", ""),
+        "ncu_bottleneck": ncu_metrics.get("ncu_bottleneck", ""),
+        "ncu_top_stall": ncu_metrics.get("ncu_top_stall", ""),
+        "summary": summary,
+    }
+    return {"analysis": analysis, "guidance": summary}
+
+
 def _run_preflight(gpu: int, nvcc_bin: str, ncu_bin: str) -> dict[str, Any]:
     preflight = collect_preflight(gpu, KERNEL_FILE, nvcc_bin=nvcc_bin, ncu_bin=ncu_bin)
     write_preflight_outputs(preflight, PREFLIGHT_JSON, PREFLIGHT_MD)
@@ -406,6 +485,11 @@ def run_experiment(
 
     benchmark_rc, benchmark_result, benchmark_command = _run_bench_to_artifacts(iter_dir, quick=quick, gpu=gpu)
     correctness_pass = (benchmark_result.get("correctness") or {}).get("passed") is True
+    primary_size = benchmark_result.get("primary_size") or {}
+    primary_dtype = None
+    sizes_payload = benchmark_result.get("sizes") or []
+    if sizes_payload:
+        primary_dtype = sizes_payload[0].get("dtype")
 
     targeted_rc = None
     full_rc = None
@@ -414,9 +498,27 @@ def run_experiment(
     ncu_metrics: dict[str, str] = {}
 
     if correctness_pass and targeted_ncu:
-        targeted_rc, targeted_meta = _run_ncu_mode(iter_dir, mode="targeted", gpu=gpu, output_name="targeted")
+        targeted_rc, targeted_meta = _run_ncu_mode(
+            iter_dir,
+            mode="targeted",
+            gpu=gpu,
+            output_name="targeted",
+            kernel_type=kernel_type,
+            size=primary_size,
+            dtype=primary_dtype,
+            bench_metrics=benchmark_result,
+        )
     if correctness_pass and full_ncu:
-        full_rc, full_meta = _run_ncu_mode(iter_dir, mode="full", gpu=gpu, output_name="full")
+        full_rc, full_meta = _run_ncu_mode(
+            iter_dir,
+            mode="full",
+            gpu=gpu,
+            output_name="full",
+            kernel_type=kernel_type,
+            size=primary_size,
+            dtype=primary_dtype,
+            bench_metrics=benchmark_result,
+        )
         full_summary = iter_dir / "full_summary.txt"
         if full_summary.exists():
             for line in full_summary.read_text(encoding="utf-8").splitlines():
@@ -430,6 +532,8 @@ def run_experiment(
                 if ":" in line and line.startswith("ncu_"):
                     key, value = line.split(":", 1)
                     ncu_metrics[key.strip()] = value.strip()
+
+    guidance_bundle = _synthesize_guidance(kernel_type, benchmark_result, ncu_metrics)
 
     record: dict[str, Any] = {
         "iteration": iteration,
@@ -458,6 +562,8 @@ def run_experiment(
         "full_report_exists": bool(full_meta.get("report")) and (ROOT / full_meta["report"]).exists(),
         "ncu_expected": full_ncu,
         "ncu_metrics": ncu_metrics,
+        "analysis": guidance_bundle["analysis"],
+        "guidance": guidance_bundle["guidance"],
         "strategy": {
             "tags": tags,
             "fingerprint": fingerprint,

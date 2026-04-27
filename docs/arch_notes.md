@@ -29,6 +29,7 @@ Key specifications and quirks for optimization, organized by architecture.
 - `flatten=True` only works with `tl.make_tensor_descriptor`, NOT with `tl.make_block_ptr`
 - L2 partition camping can occur with certain grid launch patterns — use swizzled tile ordering
 - Persistent kernels benefit from TMA but need careful barrier management
+- Hopper tensor cores are most attractive when the kernel is truly matmul-like and the active shape fills MMA tiles well; small-M or decode-like regimes can lose the throughput advantage to padding overhead and launch inefficiency
 
 ---
 
@@ -73,6 +74,7 @@ Key specifications and quirks for optimization, organized by architecture.
 - Relative to H100/A100, the much lower memory bandwidth means bandwidth-bound kernels hit the ridge point sooner.
 - The 48 MB L2 is large for a consumer card and often helps persistent or cache-friendly tiling strategies.
 - Since this is a consumer Ada card, assume no NVLink and no MIG when planning multi-GPU or partitioning workflows.
+- For matmul-like kernels in small-M or decode-like regimes, compare CUDA-core and tensor-core-with-padding paths explicitly instead of assuming tensor cores win.
 
 ---
 

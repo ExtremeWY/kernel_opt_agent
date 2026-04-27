@@ -129,6 +129,8 @@ For targeted analysis (e.g., memory access patterns, warp stalls):
 .venv/bin/python tools/ncu_profile.py --mode targeted --skills roofline,memory,warp_stall --output-prefix workspace/ncu_reports/manual_targeted > ncu.log 2>&1
 ```
 
+Note: `--skills` now extends the default targeted skill set. If you truly want to replace the default targeted skills, use `--replace-skills`, but that can drop required evidence such as `tensor_core` and `occupancy`.
+
 To compare before/after an optimization:
 
 ```bash
@@ -138,7 +140,7 @@ To compare before/after an optimization:
 **NCU analysis tells you the *specific* cause:**
 
 - **Memory-bound kernels**: Which cache level is the bottleneck? Are loads coalesced? What's the L1/L2 hit rate? How many DRAM bytes are transferred?
-- **Compute-bound kernels**: What's the tensor core utilization? What's the instruction mix? Is there warp divergence?
+- **Compute-bound kernels**: First ask whether the kernel is matmul/MMA-like, then whether the active shape regime is MMA-friendly, then inspect tensor core utilization, instruction mix, and warp behavior.
 
 ### Step 4: Hypothesize
 
@@ -150,10 +152,12 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 
 **Hypothesis workflow:**
 1. **Macro**: `tools/bench.py` roofline → is it compute-bound or memory-bound? How far from peak?
-2. **Micro**: `ncu-cli analyze` → what is the *specific* bottleneck? (stall type, cache miss, uncoalesced access, etc.)
-3. **Knowledge**: Check `CUDA_OPTIMIZATION.md` → does a known optimization address this? The "Cross-Kernel Optimization Patterns" section at the bottom organizes techniques by bottleneck type (e.g., `[register-pressure]`, `[occupancy]`, `[tensor-core]`) for easy lookup regardless of which kernel you're optimizing.
-4. **Docs**: Read relevant files in `docs/` for the specific bottleneck. The `docs/` directory contains curated references on stall reasons, synchronization, memory optimization, compute optimization, framework-specific tuning, and architecture-specific notes.
-5. **History**: Check `memory/<kernel_type>.md` → has this been tried before for this kernel?
+2. **Kernel traits**: before assuming tensor cores matter, classify whether the kernel is matmul/MMA-like and what shape regime it is in (`full_m`, `small_m`, `small_m_decode_like`, etc.).
+3. **Micro**: `ncu-cli analyze` → what is the *specific* bottleneck? (stall type, cache miss, uncoalesced access, etc.)
+4. **Tensor-core gate**: only treat low `tensor_core_pct` as actionable when the kernel is matmul-like *and* the active shape regime is MMA-friendly. For small-M / decode-like regimes, compare CUDA-core and tensor-core-with-padding paths first. For bench-only evidence on an MMA-friendly kernel, classify it as needing NCU confirmation rather than as an automatic tensor-core recommendation.
+5. **Knowledge**: Check `CUDA_OPTIMIZATION.md` → does a known optimization address this? The "Cross-Kernel Optimization Patterns" section at the bottom organizes techniques by bottleneck type (e.g., `[register-pressure]`, `[occupancy]`, `[tensor-core]`) for easy lookup regardless of which kernel you're optimizing.
+6. **Docs**: Read relevant files in `docs/` for the specific bottleneck. The `docs/` directory contains curated references on stall reasons, synchronization, memory optimization, compute optimization, framework-specific tuning, and architecture-specific notes.
+7. **History**: Check `memory/<kernel_type>.md` → has this been tried before for this kernel?
 
 **Rules:**
 - One change per experiment. Do not combine unrelated optimizations.

@@ -38,6 +38,11 @@ import torch
 
 from kernel_configs import KERNEL_CONFIGS
 
+try:
+    from .compute_traits import compute_kernel_traits, select_primary_size
+except ImportError:
+    from compute_traits import compute_kernel_traits, select_primary_size
+
 
 # ---------------------------------------------------------------------------
 # Timeout helper
@@ -1028,6 +1033,7 @@ def main():
         sys.exit(1)
 
     config = KERNEL_CONFIGS[kernel_type]
+    primary_size_label, primary_size = select_primary_size(config)
 
     # ------------------------------------------------------------------
     # GPU Detection
@@ -1095,15 +1101,8 @@ def main():
     # Performance
     # ------------------------------------------------------------------
     _perf_sizes = config["test_sizes"]
-    _perf_primary_label = None
-    _perf_primary_size = None
-    for _pl, _ps in _perf_sizes:
-        if _pl == "large":
-            _perf_primary_label = _pl
-            _perf_primary_size = _ps
-            break
-    if _perf_primary_size is None:
-        _perf_primary_label, _perf_primary_size = _perf_sizes[-1]
+    _perf_primary_label = primary_size_label
+    _perf_primary_size = primary_size
     _perf_dtype = config["test_dtypes"][0]
     _size_params = ", ".join(f"{k}={v}" for k, v in _perf_primary_size.items())
     print(f"\n=== PERFORMANCE ({_perf_primary_label}: {_size_params}, dtype={_perf_dtype}) ===")
@@ -1123,6 +1122,13 @@ def main():
         perf_results["error"] = {"code": "performance_failed", "stage": "performance", "message": f"{type(e).__name__}: {e}"}
 
     primary = perf_results.get("primary")
+    benchmark_compute_traits = compute_kernel_traits(
+        kernel_type,
+        config,
+        primary_size,
+        dtype=_perf_dtype,
+        bench_metrics=primary or {},
+    )
     if primary is not None:
         print(f"\n--- Performance Summary (primary: {primary['label']}) ---")
         print(f"latency_us: {primary['kernel_latency_us']:.2f}")
@@ -1134,6 +1140,9 @@ def main():
         print(f"arithmetic_intensity: {primary['arithmetic_intensity']:.2f}")
         print(f"ridge_point: {primary['ridge_point']:.2f}")
         print(f"bottleneck: {primary['bottleneck']}")
+        print(f"tensor_core_recommendation: {benchmark_compute_traits['tensor_core_recommendation']}")
+        print(f"tensor_core_reasoning: {benchmark_compute_traits['tensor_core_reasoning']}")
+        print(f"compute_traits_shape_regime: {benchmark_compute_traits['shape_regime']}")
         print(f"flops: {primary['flops']}")
         print(f"bytes: {primary['bytes']}")
         print(f"peak_vram_mb: {peak_vram_mb:.1f}")
@@ -1199,6 +1208,9 @@ def main():
         print(f"pct_peak_compute: {primary['pct_peak_compute']:.1f}%")
         print(f"pct_peak_bandwidth: {primary['pct_peak_bandwidth']:.1f}%")
         print(f"bottleneck: {primary['bottleneck']}")
+        print(f"tensor_core_recommendation: {benchmark_compute_traits['tensor_core_recommendation']}")
+        print(f"tensor_core_reasoning: {benchmark_compute_traits['tensor_core_reasoning']}")
+        print(f"compute_traits_shape_regime: {benchmark_compute_traits['shape_regime']}")
     else:
         print(f"speedup_vs_pytorch: 0.000x")
         print(f"pct_peak_compute: 0.0%")
@@ -1247,6 +1259,9 @@ def main():
         "bottleneck": primary["bottleneck"] if primary else "",
         "peak_vram_mb": float(peak_vram_mb),
         "bench_time_seconds": float(t_elapsed),
+        "primary_size_label": primary_size_label,
+        "primary_size": _safe_json(primary_size),
+        "compute_traits": _safe_json(benchmark_compute_traits),
         "sizes": _safe_json(all_perf),
         "error": _safe_json(perf_results.get("error")),
     }

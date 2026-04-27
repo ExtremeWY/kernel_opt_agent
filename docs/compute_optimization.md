@@ -8,6 +8,8 @@ Quick-reference for maximizing compute throughput on NVIDIA GPUs.
 
 **What**: Tensor cores perform matrix multiply-accumulate (MMA) on small matrix tiles (e.g., 16x16x16) in a single cycle.
 
+**Important gate**: Low tensor-core utilization is **not** by itself a mandate to rewrite for tensor cores. Treat it as actionable only when the kernel is matmul-like and the active problem shape is friendly to MMA tile fill.
+
 **Throughput**: 989.5 TFLOPS FP16 on H100 (with tensor cores) vs ~60 TFLOPS FP32 (without).
 
 **Requirements for tensor core usage**:
@@ -18,6 +20,21 @@ Quick-reference for maximizing compute throughput on NVIDIA GPUs.
 **Common mistake**: Casting inputs to FP32 before `tl.dot` forces scalar FMA path (16x slower).
 
 **NCU indicator**: `sm__inst_executed_pipe_tensor.sum` as fraction of total instructions.
+
+**Decision flow**:
+1. Is the kernel matmul-like or otherwise dominated by MMA-style dense dot products?
+2. Is the active shape regime MMA-friendly, or is it small-M / decode-like with poor tile fill?
+3. If you only have bench / roofline evidence and the kernel is shape-friendly, treat the state as **needs NCU evidence**, not as an immediate tensor-core mandate.
+4. Only after NCU shows low `ncu_tensor_core_pct` should tensor-core work become a high-priority redesign path.
+5. The default targeted NCU skill set already includes tensor-core utilization evidence, so a normal targeted profile can promote `needs_ncu_evidence` to `recommended` when the kernel is MMA-friendly and tensor-core instruction share is low.
+
+**Small-M / decode-like warning**:
+- For MMA tile `m=16`, an effective M below 16-32 often leaves tensor cores under-filled.
+- In decode-like cases such as batch < 16 and short query length, padding and packing overhead can erase tensor-core gains.
+- In these regimes, explicitly compare:
+  - CUDA-core path
+  - tensor-core path with padding / packing
+- Useful heuristics to record are `mma_m_fill_ratio = effective_m / padded_m` and `padding_overhead_ratio = padded_m / effective_m - 1`.
 
 **Tile size guidance for GEMM**:
 
@@ -113,7 +130,7 @@ Quick-reference for maximizing compute throughput on NVIDIA GPUs.
 
 **Diminishing returns**: Going from 25% to 50% occupancy usually helps a lot. Going from 50% to 75% helps less. Above 75% rarely helps and can hurt (more register pressure, more L1 contention).
 
-**When low occupancy is OK**: Compute-bound kernels with high IPC. If tensor cores are >80% utilized, occupancy doesn't matter.
+**When low occupancy is OK**: Compute-bound kernels with high IPC. If tensor cores are >80% utilized *and* the kernel is in an MMA-friendly shape regime, occupancy usually matters less.
 
 ---
 
