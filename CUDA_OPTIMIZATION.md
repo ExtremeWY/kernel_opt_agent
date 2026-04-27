@@ -1,8 +1,142 @@
 # CUDA Kernel Optimization Guide
 
-This document is **maintained by the optimization agent**. As kernels are optimized, the agent summarizes effective optimization strategies here, organized by kernel type and by cross-kernel pattern. This serves as a growing knowledge base for future optimization runs.
+This document is **maintained by the optimization agent**. It serves two roles:
 
-When investigating a specific bottleneck, read the relevant files in `docs/` directly (e.g. `docs/stall_reasons.md`, `docs/memory_optimization.md`, `docs/compute_optimization.md`, `docs/arch_notes.md`).
+1. a **systematic index** that maps bottlenecks, kernel styles, and hardware
+   features to the right reference material
+2. a **living record** of optimization patterns that worked or failed on kernels
+   in this repository
+
+Use this file as the front door. Use `docs/` for the detailed reference manual.
+
+---
+
+## How To Use This File
+
+When starting a new optimization iteration:
+
+1. identify the macro bottleneck with `tools/bench.py`
+2. identify the micro bottleneck with `tools/ncu_profile.py`
+3. use the indexes below to jump to the right `docs/` references
+4. check the matching strategy tags in the kernel-specific and cross-kernel
+   sections
+5. only then propose a single focused change
+
+This file should stay compact and navigable. Long-form explanations belong in
+`docs/`.
+
+---
+
+## Reference Index
+
+### By Bottleneck
+
+| Bottleneck or symptom | Primary docs | Typical strategy tags |
+|---|---|---|
+| compute-bound GEMM / tensor-core issues | `docs/compute_optimization.md`, `docs/triton_optimization.md`, `docs/cutlass_optimization.md` | `[tensor-core]`, `[tile-size]`, `[data-type]` |
+| memory-bound streaming kernel | `docs/memory_optimization.md`, `docs/stall_reasons.md` | `[memory-coalescing]`, `[vectorized-loads]`, `[cache]` |
+| low occupancy | `docs/compute_optimization.md`, `docs/triton_optimization.md` | `[occupancy]`, `[register-pressure]`, `[launch-config]` |
+| high register count / spills | `docs/compute_optimization.md`, `docs/triton_optimization.md` | `[register-pressure]`, `[tile-size]` |
+| barrier / wait / fence stalls | `docs/sync_optimization.md`, `docs/stall_reasons.md` | `[sync]`, `[warp-divergence]`, `[algorithmic]` |
+| poor L1 / L2 reuse | `docs/memory_optimization.md`, `docs/arch_notes.md` | `[cache]`, `[memory-access]`, `[tile-order]` |
+| branch-heavy hot loop | `docs/compute_optimization.md`, `docs/sync_optimization.md` | `[warp-divergence]`, `[algorithmic]` |
+| architecture-specific async copy or pipeline issue | `docs/arch_notes.md`, `docs/memory_optimization.md`, `docs/sync_optimization.md` | `[pipeline]`, `[memory-access]`, `[launch-config]` |
+
+### By Kernel Style
+
+| Kernel style | Primary docs | Typical first checks |
+|---|---|---|
+| Triton elementwise / reduction | `docs/triton_optimization.md`, `docs/memory_optimization.md` | coalescing, tile width, occupancy |
+| Triton GEMM / attention | `docs/triton_optimization.md`, `docs/compute_optimization.md`, `docs/sync_optimization.md` | tensor-core path, tile size, registers, stages |
+| CUTLASS GEMM / conv | `docs/cutlass_optimization.md`, `docs/compute_optimization.md`, `docs/memory_optimization.md` | tile shape, stage count, schedule, epilogue |
+| CUDA C custom kernel | `docs/compute_optimization.md`, `docs/memory_optimization.md`, `docs/sync_optimization.md` | launch config, shared memory, warp primitives |
+
+### By Architecture Feature
+
+| Feature | Primary docs | Notes |
+|---|---|---|
+| tensor cores / MMA | `docs/compute_optimization.md` | includes BF16 / FP16 / TF32 guidance |
+| `cp.async` / software pipelining | `docs/memory_optimization.md`, `docs/sync_optimization.md` | validate both overlap and correctness |
+| TMA / Hopper+ features | `docs/arch_notes.md`, `docs/cutlass_optimization.md`, `docs/triton_optimization.md` | layout and pipeline semantics matter |
+| warp specialization | `docs/compute_optimization.md`, `docs/sync_optimization.md` | often limited by registers and barriers |
+| swizzle / tile ordering | `docs/memory_optimization.md`, `docs/triton_optimization.md`, `docs/cutlass_optimization.md` | use only when locality justifies it |
+
+---
+
+## Strategy Tag Index
+
+The repository uses short reusable tags in experiment notes and this guide.
+
+| Tag | Meaning | Go read first |
+|---|---|---|
+| `[tensor-core]` | tensor-core enablement or utilization | `docs/compute_optimization.md` |
+| `[register-pressure]` | registers per thread, spills, occupancy limit | `docs/compute_optimization.md` |
+| `[occupancy]` | active warps / blocks per SM | `docs/compute_optimization.md` |
+| `[tile-size]` | tile shape, block geometry, MMA decomposition | `docs/triton_optimization.md`, `docs/cutlass_optimization.md` |
+| `[launch-config]` | persistent vs non-persistent, block count, grid mapping | `docs/triton_optimization.md`, `docs/compute_optimization.md` |
+| `[memory-coalescing]` | load/store access quality | `docs/memory_optimization.md` |
+| `[vectorized-loads]` | wide loads / stores and alignment | `docs/memory_optimization.md` |
+| `[cache]` | L1/L2 residency, eviction policy, tile reuse | `docs/memory_optimization.md` |
+| `[memory-access]` | broader address-generation and staging issues | `docs/memory_optimization.md` |
+| `[warp-divergence]` | branch-heavy or mask-heavy hot paths | `docs/compute_optimization.md` |
+| `[algorithmic]` | work reduction, loop simplification, mathematical restructuring | `docs/compute_optimization.md`, `docs/triton_optimization.md` |
+| `[sync]` | barrier, wait, fence, pipeline protocol | `docs/sync_optimization.md` |
+| `[data-type]` | precision path, accumulator type, conversion cost | `docs/compute_optimization.md` |
+| `[pipeline]` | async copy depth, producer / consumer overlap | `docs/memory_optimization.md`, `docs/sync_optimization.md` |
+
+---
+
+## Investigation Playbooks
+
+### Compute-Bound Playbook
+
+1. confirm tensor-core path
+2. inspect tile shape and data type
+3. inspect registers per thread and achieved occupancy
+4. only then try deeper pipeline, warp specialization, or epilogue fusion
+
+Read first:
+
+- `docs/compute_optimization.md`
+- `docs/triton_optimization.md` or `docs/cutlass_optimization.md`
+
+### Memory-Bound Playbook
+
+1. check coalescing and sectors/request
+2. inspect vectorization and alignment
+3. inspect L1/L2 hit rate and tile order
+4. inspect `long_scoreboard` and staging depth
+
+Read first:
+
+- `docs/memory_optimization.md`
+- `docs/stall_reasons.md`
+- `docs/triton_optimization.md` for Triton kernels
+
+### Synchronization-Limited Playbook
+
+1. check `wait`, `barrier`, and `membar`
+2. reduce synchronization scope if valid
+3. replace shared-memory exchange with warp intrinsics where possible
+4. inspect producer / consumer protocol before changing tile size
+
+Read first:
+
+- `docs/sync_optimization.md`
+- `docs/stall_reasons.md`
+
+---
+
+## Kernel-Specific Notes
+
+The sections below capture repository-specific observations. They are more
+actionable than generic advice, but less general than the `docs/` references.
+
+When a new experiment succeeds or fails in a transferable way, update:
+
+- the relevant kernel section below
+- `Cross-Kernel Optimization Patterns`
+- `CUDA_OPTIMIZATION.md` tag usage if a new stable tag emerges
 
 ---
 

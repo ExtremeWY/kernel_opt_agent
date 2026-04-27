@@ -62,7 +62,74 @@ Replace the sample placeholder kernel with real target-platform kernels. Each ke
 
 If the target platform requires compilation or module loading, add helper functions inside the kernel module or centralize them in the platform adapter.
 
-## 2. Configuration Files To Fill
+## 2. Generic Workflow Files You Now Need To Maintain
+
+### `tools/preflight.py`
+
+Fill or extend:
+
+- adapter readiness checks
+- kernel file checks
+- vendor CLI presence checks
+- platform-specific warnings that should appear in `workspace/preflight_check.{json,md}`
+
+### `tools/bench.py`
+
+Keep the normalized output schema intact. Only change this file if the platform needs extra generic fields.
+
+The benchmark JSON should continue to provide:
+
+- correctness
+- kernel timing
+- reference timing
+- achieved compute and memory throughput
+- roofline peaks
+- bottleneck classification
+- structured `error`
+
+### `tools/profile.py`
+
+Keep this wrapper generic. Put vendor-specific collection and parsing inside the profiler backend whenever possible.
+
+This tool should continue to write:
+
+- `profile_report.txt` or the platform equivalent report path
+- `profile_summary.txt`
+- `profile_details.txt`
+- normalized metrics on stdout
+
+### `tools/run_loop.py`
+
+This file now owns the artifact-aware experiment loop. Update it only if your platform requires extra keep/revert constraints.
+
+It is responsible for:
+
+- `workspace/runs/run_<timestamp>/`
+- `iter_vN/`
+- `run_manifest.json`
+- `final_summary.md`
+- `iteration_summary.md`
+- proposal template materialization
+- strategy memory updates
+
+### `tools/strategy_memory.py`
+
+Keep the schema stable unless the generic experiment semantics truly need to change.
+
+The framework expects:
+
+- `positive`
+- `negative`
+- `rejected`
+- `strategy_tags`
+- `strategy_fingerprint`
+- blocked and preferred constraints
+
+### `tools/iteration_report.py`
+
+This file renders markdown from the structured artifacts. Update it if you add new generic metrics or new report sections.
+
+## 3. Configuration Files To Fill
 
 ### `kernel_configs/*.toml`
 
@@ -85,7 +152,7 @@ For each kernel type, implement:
 
 These files are platform-neutral. They define the optimization problem and correctness contract.
 
-## 3. Documentation To Add
+## 4. Documentation To Add
 
 ### `docs/arch_notes.md`
 
@@ -127,7 +194,19 @@ Translate profiler stall metrics into human-usable meanings:
 - what causes it
 - how to mitigate it
 
-## 4. Knowledge Base To Maintain
+### `docs/experiment_artifacts.md`
+
+Keep this file aligned with the artifact directory layout produced by `tools/run_loop.py`.
+
+### `docs/strategy_memory.md`
+
+Keep this file aligned with:
+
+- `workspace/strategy_memory/global_strategy_memory.json`
+- `tools/strategy_memory.py`
+- the proposal tagging workflow
+
+## 5. Knowledge Base To Maintain
 
 ### `knowledge/custom_platform/OPTIMIZATION.md`
 
@@ -140,30 +219,20 @@ This file is the platform-specific optimization memory for the agent. Populate i
 
 Keep the format concise and greppable so the agent can use it during hypothesis generation.
 
-## 5. Tooling To Wire In
+## 6. Workspace Files And Templates
 
-### `tools/prepare.py`
+These generic files are now part of the scaffold and usually should not be removed:
 
-You may need to extend it to check:
+- `workspace/results.tsv`
+- `workspace/preflight_check.json`
+- `workspace/preflight_check.md`
+- `workspace/runs/.gitkeep`
+- `workspace/optimization_proposal.template.md`
+- `workspace/strategy_memory/global_strategy_memory.json`
 
-- vendor compiler
-- profiler CLI
-- runtime libraries
-- backend framework installation
+You may change the template text, but keep the purpose of each file unchanged.
 
-### `tools/bench.py`
-
-Only modify this file if the target platform needs extra benchmark outputs beyond the normalized schema already supported by `PlatformAdapter`.
-
-### `tools/profile.py`
-
-Only modify this file if the normalized schema needs new generic fields. Prefer putting platform-specific parsing inside the profiler backend instead.
-
-### `tools/run_loop.py`
-
-Modify only if your keep/revert policy depends on platform-specific constraints not already represented by the generic metrics.
-
-## 6. Hardware Documentation You Need
+## 7. Hardware Documentation You Need
 
 Before implementation, collect these documents from the target hardware vendor:
 
@@ -176,7 +245,7 @@ Before implementation, collect these documents from the target hardware vendor:
 - device specification sheet with peak compute, bandwidth, cache sizes, and memory size
 - matrix engine or tensor engine instruction reference if available
 
-## 7. Minimum Path To First Working Port
+## 8. Minimum Path To First Working Port
 
 1. Implement `platforms/custom_platform/adapter.py`.
 2. Implement `profilers/custom_placeholder.py`.
@@ -184,9 +253,20 @@ Before implementation, collect these documents from the target hardware vendor:
 4. Update `kernel_configs/example_op.*` to match the real kernel.
 5. Fill `docs/*.md` with platform terminology and profiler metric mapping.
 6. Run `python custom_platform/tools/prepare.py --allow-placeholder` first, then without the flag after implementation.
-7. Copy a real kernel to `custom_platform/kernel.py` and run the benchmark and profiler flow.
+7. Copy a real kernel to `custom_platform/kernel.py` and run the benchmark/profile loop.
+8. Verify `workspace/runs/run_<timestamp>/` contains complete artifacts and strategy memory updates.
 
-## 8. Files You Usually Do Not Need To Change
+The scaffold also ships with `mock_platform`, which is useful for validating:
+
+- manifest generation
+- artifact layout
+- benchmark JSON output
+- profiler summary generation
+- strategy memory updates
+
+Do not use the mock backend as a performance baseline for the real platform.
+
+## 9. Files You Usually Do Not Need To Change
 
 These should remain mostly generic:
 
@@ -195,7 +275,5 @@ These should remain mostly generic:
 - `kernel_configs/__init__.py`
 - `references/__init__.py`
 - `workspace/MEMORY.md`
-- `workspace/results.tsv`
 
 If you need to edit them, the abstraction boundary is probably still too weak.
-

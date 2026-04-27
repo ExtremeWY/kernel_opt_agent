@@ -132,3 +132,108 @@ Quick-reference for maximizing compute throughput on NVIDIA GPUs.
 **AVO technique**: Adjust per-warp-group register allocation to eliminate spills in bottleneck group:
 - Original: 192/80/48 → correction warp spills to local memory
 - Optimized: 184/88/56 → no spills, +2.1% performance
+
+---
+
+## Warp-Level Compute Primitives
+
+Warp intrinsics are not just communication helpers. They are compute primitives
+that often replace shared-memory staging and synchronization.
+
+Useful tools:
+
+- `__shfl_sync`, `__shfl_down_sync`, `__shfl_xor_sync` for reduction, scan, and
+  broadcast
+- `__ballot_sync`, `__all_sync`, `__any_sync` for warp-wide condition handling
+- `__match_any_sync`, `__match_all_sync` for grouping identical values
+
+Use them when:
+
+- data exchange stays inside a warp
+- shared-memory traffic is too high relative to compute
+- bank conflicts or barrier overhead show up in NCU
+
+For synchronization details, see `docs/sync_optimization.md`.
+
+---
+
+## Loop and ILP Optimization
+
+Loop structure often decides how much instruction-level parallelism the compiler
+can expose.
+
+Useful transformations:
+
+- loop unrolling for small fixed trip counts
+- loop fusion when multiple passes touch the same data
+- loop fission when one large loop creates too much register pressure
+- loop interchange when it improves memory access order
+- software pipelining in steady-state load / compute loops
+
+Watch for the tradeoff:
+
+- more unrolling can raise ILP
+- too much unrolling can bloat register usage and instruction cache pressure
+
+---
+
+## Reduction and Scan Patterns
+
+Common high-performance reduction structure:
+
+1. reduce inside a warp with shuffle intrinsics
+2. combine warp partials through shared memory or a narrow synchronization scope
+3. finish block-level reduction
+4. reduce across blocks with atomics or a second kernel when needed
+
+Scan / prefix-sum kernels should also be treated as staged algorithms rather
+than naive nested loops. The key concern is usually synchronization and memory
+traffic, not arithmetic throughput.
+
+---
+
+## Fast Math and Strength Reduction
+
+Use mathematical approximations only when the accuracy budget allows it.
+
+Typical examples:
+
+- reciprocal plus multiply instead of division
+- `rsqrt` instead of `1 / sqrt`
+- explicit FMA for fused multiply-add patterns
+- `exp2`-style fast paths when algebra permits
+- bit operations instead of integer divide / modulo by powers of two
+
+Always validate:
+
+- correctness tolerances
+- numerical stability on adversarial inputs
+- whether the faster instruction mix actually improved kernel time
+
+---
+
+## Compiler Guidance and Verification
+
+Helpful tools and levers:
+
+- `__restrict__` to reduce aliasing pessimism
+- `__forceinline__` or `__noinline__` to manage code size and register pressure
+- `--use_fast_math` or narrower math flags when appropriate
+- PTX / SASS inspection to confirm the intended instruction path
+
+When a change should have produced tensor-core, async-copy, or reduced-spill
+codegen but performance does not move, inspect generated code instead of
+guessing.
+
+---
+
+## Validation Checklist
+
+Pair compute-oriented changes with:
+
+- tensor-core utilization
+- instruction mix
+- registers per thread
+- local-memory / spill behavior
+- achieved occupancy
+- kernel latency, not just a single micro metric

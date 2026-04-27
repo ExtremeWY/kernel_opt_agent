@@ -127,3 +127,107 @@ Setting `num_stages=2` or `num_stages=3` overlaps loads with compute.
 **Rule of thumb**:
 - Memory-bound + long_scoreboard stalls: increase `num_stages`
 - Already at shared memory limit: reduce `num_stages` or reduce tile size
+
+---
+
+## Read-Only and Specialized Cache Paths
+
+Read-only data can behave differently from general global-memory traffic.
+
+Useful tools:
+
+- `const __restrict__` for alias-free read-only pointers
+- `__ldg()` on older or specific read-mostly paths
+- texture / surface objects for 2D spatial-locality-heavy access patterns
+
+Do not treat `__ldg()` as an automatic win on every modern GPU. Validate it
+against actual cache behavior and kernel latency.
+
+---
+
+## L2 Persistence and Access Policy
+
+If a small hot data region is reused across many blocks, L2 persistence can help.
+
+Relevant mechanisms:
+
+- `cudaAccessPolicyWindow`
+- persisting vs streaming access properties
+
+This is most useful when:
+
+- the working set is small relative to L2
+- the data is reused across many CTAs
+- the normal launch order would otherwise evict it too early
+
+If the kernel is streaming with little temporal reuse, forcing persistence may
+hurt rather than help.
+
+---
+
+## Constant Memory
+
+Constant memory is effective when:
+
+- the data is small
+- many threads read the same location at the same time
+
+It is a poor choice when each lane accesses different constant addresses, since
+that can serialize the access.
+
+Typical use cases:
+
+- small lookup tables
+- scalar coefficient blocks
+- compact parameter sets shared across the whole kernel
+
+---
+
+## Data Layout Choices
+
+Data layout often dominates memory efficiency before any lower-level tuning.
+
+Common rules:
+
+- prefer structure-of-arrays over array-of-structures for warp-parallel field
+  access
+- pad rows or leading dimensions to preserve alignment
+- reorder irregular problems when locality is poor
+
+Good examples:
+
+- CSR row bucketing for sparse workloads
+- padding matrix leading dimensions for vectorized loads
+- swizzled layout or block reordering for better cache reuse
+
+---
+
+## Host-to-Device and Runtime Memory Paths
+
+These do not change kernel micro-architecture directly, but they matter for
+end-to-end throughput.
+
+Useful tools:
+
+- pinned host memory for faster async transfers
+- `cudaMallocAsync` / `cudaFreeAsync`
+- CUDA memory pools
+- `cudaMemPrefetchAsync` and `cudaMemAdvise` for Unified Memory workloads
+- zero-copy only for very small or one-touch datasets
+
+Keep these separate from kernel-only conclusions in experiment notes.
+
+---
+
+## Validation Checklist
+
+Pair memory-oriented changes with:
+
+- sectors per request / coalescing quality
+- L1 and L2 hit rates
+- DRAM throughput
+- shared-memory bank conflict counters
+- kernel latency and effective throughput
+
+If a local metric improves but total runtime gets worse, the bottleneck probably
+moved rather than disappeared.

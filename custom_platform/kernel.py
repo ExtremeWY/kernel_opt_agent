@@ -1,7 +1,7 @@
 """Working kernel copy used by the experiment loop.
 
-Replace this file by copying one kernel from kernels/ before running benchmarks.
+The default copy points at the mock platform example so the full artifact
+pipeline can run even without vendor hardware.
 """
 
-from kernels.example_op import KERNEL_TYPE, TARGET_PLATFORM, kernel_fn
-
+from kernels.mock_elementwise import KERNEL_TYPE, TARGET_PLATFORM, kernel_fn

@@ -20,13 +20,19 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import os
 import signal
 import sys
 import time
 import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, Tuple
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 
@@ -39,6 +45,73 @@ from kernel_configs import KERNEL_CONFIGS
 
 class BenchTimeoutError(Exception):
     pass
+
+
+def _safe_json(value):
+    if isinstance(value, dict):
+        return {str(k): _safe_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe_json(v) for v in value]
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        try:
+            return {
+                "type": type(value).__name__,
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            }
+        except Exception:
+            return repr(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _write_json_out(path: str | None, payload: dict) -> None:
+    if not path:
+        return
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _error_payload(code: str, stage: str, message: str, kernel_type: str | None = None) -> dict:
+    return {
+        "kernel_type": kernel_type,
+        "correctness": {
+            "checked": False,
+            "passed": False,
+            "smoke_test": "SKIP",
+            "shape_sweep": "SKIP",
+            "numerical_stability": "SKIP",
+            "determinism": "SKIP",
+            "edge_cases": "SKIP",
+        },
+        "kernel": {
+            "average_ms": 0.0,
+            "median_ms": 0.0,
+            "min_ms": 0.0,
+            "max_ms": 0.0,
+        },
+        "reference": {
+            "average_ms": 0.0,
+            "median_ms": 0.0,
+            "min_ms": 0.0,
+            "max_ms": 0.0,
+        },
+        "speedup_vs_pytorch": 0.0,
+        "throughput_tflops": 0.0,
+        "bandwidth_gb_s": 0.0,
+        "pct_peak_compute": 0.0,
+        "pct_peak_bandwidth": 0.0,
+        "bottleneck": "",
+        "peak_vram_mb": 0.0,
+        "bench_time_seconds": 0.0,
+        "error": {
+            "code": code,
+            "stage": stage,
+            "message": message,
+        },
+    }
 
 
 class _Timeout:
@@ -578,12 +651,18 @@ def _peak_tflops_for_dtype(gpu: GPUSpec, dtype: torch.dtype) -> float:
     return gpu.peak_tflops_fp16
 
 
-def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
-    """Benchmark a function and return median time in milliseconds."""
+def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> dict:
+    """Benchmark a function and return timing statistics in milliseconds."""
     try:
         from triton.testing import do_bench
         ms = do_bench(fn, warmup=warmup, rep=rep)
-        return ms
+        ms_f = float(ms)
+        return {
+            "average_ms": ms_f,
+            "median_ms": ms_f,
+            "min_ms": ms_f,
+            "max_ms": ms_f,
+        }
     except ImportError:
         pass
 
@@ -602,7 +681,12 @@ def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> float:
         times.append(start.elapsed_time(end))
 
     times.sort()
-    return times[len(times) // 2]
+    return {
+        "average_ms": sum(times) / len(times),
+        "median_ms": times[len(times) // 2],
+        "min_ms": times[0],
+        "max_ms": times[-1],
+    }
 
 
 def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
@@ -655,11 +739,13 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
 
             _k_inputs = inputs
             with _Timeout(30):
-                kernel_ms = _do_bench(lambda _i=_k_inputs: kernel_fn(**_i), warmup=25, rep=100)
+                kernel_stats = _do_bench(lambda _i=_k_inputs: kernel_fn(**_i), warmup=25, rep=100)
 
             with _Timeout(30):
-                ref_ms = _do_bench(lambda _i=_k_inputs: ref_fn(_i), warmup=25, rep=100)
+                ref_stats = _do_bench(lambda _i=_k_inputs: ref_fn(_i), warmup=25, rep=100)
 
+            kernel_ms = kernel_stats["median_ms"]
+            ref_ms = ref_stats["median_ms"]
             kernel_us = kernel_ms * 1000.0
             ref_us = ref_ms * 1000.0
             throughput_tflops = flops / (kernel_ms / 1000.0) / 1e12 if kernel_ms > 0 else 0.0
@@ -687,6 +773,14 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
                 "dtype": str(dtype),
                 "flops": flops,
                 "bytes": nbytes,
+                "kernel_average_ms": kernel_stats["average_ms"],
+                "kernel_median_ms": kernel_stats["median_ms"],
+                "kernel_min_ms": kernel_stats["min_ms"],
+                "kernel_max_ms": kernel_stats["max_ms"],
+                "reference_average_ms": ref_stats["average_ms"],
+                "reference_median_ms": ref_stats["median_ms"],
+                "reference_min_ms": ref_stats["min_ms"],
+                "reference_max_ms": ref_stats["max_ms"],
                 "kernel_latency_us": kernel_us,
                 "pytorch_latency_us": ref_us,
                 "throughput_tflops": throughput_tflops,
@@ -785,6 +879,7 @@ def run_profile(kernel_fn: Callable, config: dict):
 
 def main():
     t_start = time.time()
+    json_out = None
 
     parser = argparse.ArgumentParser(description="cuda-evolve benchmark harness")
     parser.add_argument("--kernel", type=str, default=None,
@@ -795,7 +890,14 @@ def main():
                         help="Quick mode: skip correctness stages 3-5, bench only large size")
     parser.add_argument("--profile", action="store_true",
                         help="Enable torch profiler trace")
+    parser.add_argument("--json-out", type=str, default=None,
+                        help="Write structured benchmark result JSON to this path")
+    parser.add_argument("--emit-error-code", action="store_true",
+                        help="Print machine-readable error fields on failure")
+    parser.add_argument("--gpu", type=int, default=0,
+                        help="CUDA device index to benchmark on")
     args = parser.parse_args()
+    json_out = args.json_out
 
     # ------------------------------------------------------------------
     # Import the kernel module
@@ -803,6 +905,24 @@ def main():
     print("=" * 60)
     print("cuda-evolve Benchmark Harness")
     print("=" * 60)
+
+    if not torch.cuda.is_available():
+        message = "No CUDA GPU available"
+        print(f"ERROR: {message}")
+        payload = _error_payload("setup_failed", "setup", message)
+        payload["bench_time_seconds"] = time.time() - t_start
+        _write_json_out(json_out, payload)
+        sys.exit(1)
+
+    try:
+        torch.cuda.set_device(args.gpu)
+    except Exception as e:
+        message = f"Failed to select CUDA device {args.gpu}: {e}"
+        print(f"ERROR: {message}")
+        payload = _error_payload("setup_failed", "setup", message)
+        payload["bench_time_seconds"] = time.time() - t_start
+        _write_json_out(json_out, payload)
+        sys.exit(1)
 
     kernel_module = None
     kernel_fn = None
@@ -833,6 +953,9 @@ def main():
         traceback.print_exc()
         print(f"\ncorrectness: FAIL")
         print(f"throughput_tflops: 0.000")
+        payload = _error_payload("kernel_import_failed", "import", f"SyntaxError: {e}", kernel_type)
+        payload["bench_time_seconds"] = time.time() - t_start
+        _write_json_out(json_out, payload)
         sys.exit(1)
     except Exception as e:
         print(f"\nERROR: Failed to import kernel.py:")
@@ -840,6 +963,9 @@ def main():
         traceback.print_exc()
         print(f"\ncorrectness: FAIL")
         print(f"throughput_tflops: 0.000")
+        payload = _error_payload("kernel_import_failed", "import", f"{type(e).__name__}: {e}", kernel_type)
+        payload["bench_time_seconds"] = time.time() - t_start
+        _write_json_out(json_out, payload)
         sys.exit(1)
 
     if kernel_type not in KERNEL_CONFIGS:
@@ -847,6 +973,9 @@ def main():
         print(f"  Available: {', '.join(KERNEL_CONFIGS.keys())}")
         print(f"\ncorrectness: FAIL")
         print(f"throughput_tflops: 0.000")
+        payload = _error_payload("unknown_kernel_type", "config", f"Unknown kernel type '{kernel_type}'", kernel_type)
+        payload["bench_time_seconds"] = time.time() - t_start
+        _write_json_out(json_out, payload)
         sys.exit(1)
 
     config = KERNEL_CONFIGS[kernel_type]
@@ -876,8 +1005,15 @@ def main():
     except Exception as e:
         print(f"\nFATAL: Correctness testing crashed: {type(e).__name__}: {e}")
         traceback.print_exc()
-        correctness_results = {"correctness": "FAIL", "smoke_test": "CRASH", "shape_sweep": "CRASH",
-                               "numerical_stability": "CRASH", "determinism": "CRASH", "edge_cases": "CRASH"}
+        correctness_results = {
+            "correctness": "FAIL",
+            "smoke_test": "CRASH",
+            "shape_sweep": "CRASH",
+            "numerical_stability": "CRASH",
+            "determinism": "CRASH",
+            "edge_cases": "CRASH",
+            "details": [f"{type(e).__name__}: {e}"],
+        }
 
     print(f"\n--- Correctness Summary ---")
     print(f"smoke_test: {correctness_results.get('smoke_test', 'N/A')}")
@@ -916,6 +1052,7 @@ def main():
     except Exception as e:
         print(f"\nFATAL: Performance benchmarking crashed: {type(e).__name__}: {e}")
         traceback.print_exc()
+        perf_results["error"] = {"code": "performance_failed", "stage": "performance", "message": f"{type(e).__name__}: {e}"}
 
     primary = perf_results.get("primary")
     if primary is not None:
@@ -1002,6 +1139,50 @@ def main():
 
     if t_elapsed > 90:
         print(f"WARNING: bench.py took {t_elapsed:.1f}s (budget: 90s)")
+
+    payload = {
+        "kernel_type": kernel_type,
+        "gpu_name": gpu.name,
+        "gpu_compute_capability": f"{gpu.compute_capability[0]}.{gpu.compute_capability[1]}",
+        "gpu_memory_gb": gpu.memory_gb,
+        "peak_tflops_fp16": gpu.peak_tflops_fp16,
+        "peak_tflops_bf16": gpu.peak_tflops_bf16,
+        "peak_tflops_fp32": gpu.peak_tflops_fp32,
+        "peak_bandwidth_gb_s": gpu.peak_bandwidth_gb_s,
+        "correctness": {
+            "checked": True,
+            "passed": correctness_results.get("correctness") == "PASS",
+            "smoke_test": correctness_results.get("smoke_test"),
+            "shape_sweep": correctness_results.get("shape_sweep"),
+            "numerical_stability": correctness_results.get("numerical_stability"),
+            "determinism": correctness_results.get("determinism"),
+            "edge_cases": correctness_results.get("edge_cases"),
+            "details": _safe_json(correctness_results.get("details", [])),
+        },
+        "kernel": {
+            "average_ms": float(primary["kernel_average_ms"]) if primary else 0.0,
+            "median_ms": float(primary["kernel_median_ms"]) if primary else 0.0,
+            "min_ms": float(primary["kernel_min_ms"]) if primary else 0.0,
+            "max_ms": float(primary["kernel_max_ms"]) if primary else 0.0,
+        },
+        "reference": {
+            "average_ms": float(primary["reference_average_ms"]) if primary else 0.0,
+            "median_ms": float(primary["reference_median_ms"]) if primary else 0.0,
+            "min_ms": float(primary["reference_min_ms"]) if primary else 0.0,
+            "max_ms": float(primary["reference_max_ms"]) if primary else 0.0,
+        },
+        "speedup_vs_pytorch": float(primary["speedup_vs_pytorch"]) if primary else 0.0,
+        "throughput_tflops": float(throughput),
+        "bandwidth_gb_s": float(primary["bandwidth_gb_s"]) if primary else 0.0,
+        "pct_peak_compute": float(primary["pct_peak_compute"]) if primary else 0.0,
+        "pct_peak_bandwidth": float(primary["pct_peak_bandwidth"]) if primary else 0.0,
+        "bottleneck": primary["bottleneck"] if primary else "",
+        "peak_vram_mb": float(peak_vram_mb),
+        "bench_time_seconds": float(t_elapsed),
+        "sizes": _safe_json(all_perf),
+        "error": _safe_json(perf_results.get("error")),
+    }
+    _write_json_out(json_out, payload)
 
 
 if __name__ == "__main__":

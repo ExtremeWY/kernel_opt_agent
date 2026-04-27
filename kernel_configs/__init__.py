@@ -68,7 +68,10 @@ def _build_config(toml_path: pathlib.Path) -> Dict[str, Any]:
         cfg["multi_output"] = True
 
     cfg["test_sizes"] = _parse_sizes(data["test_sizes"])
-    cfg["test_dtypes"] = _parse_dtypes(data["test_dtypes"])
+    raw_dtypes = data.get("test_dtypes", meta.get("test_dtypes"))
+    if raw_dtypes is None:
+        raise KeyError("test_dtypes")
+    cfg["test_dtypes"] = _parse_dtypes(raw_dtypes)
     cfg["tolerances"] = _parse_tolerances(data["tolerances"])
 
     edge_raw = data.get("edge_sizes", [])

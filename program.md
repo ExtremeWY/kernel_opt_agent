@@ -35,8 +35,9 @@ To add a new kernel, create `kernel_configs/<name>.toml` (sizes, dtypes, toleran
 ## Setup Phase
 
 1. Run `uv run tools/prepare.py` to validate the environment (CUDA, GPU, dependencies).
-2. Read `CUDA_OPTIMIZATION.md` to review optimization strategies discovered in previous runs. (This file is maintained by you — the agent — and may be empty on the first run.)
-3. Read `workspace/MEMORY.md` for the global optimization summary across all kernels.
+2. Review `workspace/preflight_check.md`. If preflight is not ready, fix blocking issues before starting experiments.
+3. Read `CUDA_OPTIMIZATION.md` to review optimization strategies discovered in previous runs. (This file is maintained by you — the agent — and may be empty on the first run.)
+4. Read `workspace/MEMORY.md` for the global optimization summary across all kernels.
 4. **Select a kernel** to optimize. Copy from the baseline `kernels/` directory (or from `kernels_optimized/` if a previous optimized version exists):
    ```bash
    # First run: start from baseline
@@ -49,8 +50,10 @@ To add a new kernel, create `kernel_configs/<name>.toml` (sizes, dtypes, toleran
    cp kernels/<your_kernel>.cu kernel.cu    # if it exists
    ```
 5. Read the per-kernel log in `memory/<kernel_type>.md` if it exists, to review past experiments for this specific kernel.
-6. Read `kernel.py` to understand the current kernel implementation.
-7. Read the relevant module(s) in `references/` (per-kernel reference implementations) to understand the correctness specification.
+6. Read the relevant optimization references in `docs/`, especially `docs/triton_optimization.md`, `docs/cutlass_optimization.md`, `docs/sync_optimization.md`, `docs/compute_optimization.md`, `docs/memory_optimization.md`, and `docs/stall_reasons.md`.
+7. Read `docs/strategy_memory.md` and respect the `blocked` / `preferred` fingerprints already recorded in `workspace/strategy_memory/global_strategy_memory.json`.
+8. Read `kernel.py` to understand the current kernel implementation.
+9. Read the relevant module(s) in `references/` (per-kernel reference implementations) to understand the correctness specification.
 
 ## Experiment Loop
 
@@ -58,16 +61,16 @@ Repeat the following cycle:
 
 ### Step 1: Benchmark (baseline or after change)
 
-Run the benchmark harness. It auto-detects `KERNEL_TYPE` from `kernel.py`:
+Run the benchmark harness. It auto-detects `KERNEL_TYPE` from `kernel.py` and should emit structured JSON:
 
 ```bash
-uv run tools/bench.py > run.log 2>&1
+uv run tools/bench.py --json-out workspace/last_bench.json > run.log 2>&1
 ```
 
 For quick iteration (skip numerical stability, determinism, edge cases):
 
 ```bash
-uv run tools/bench.py --quick > run.log 2>&1
+uv run tools/bench.py --quick --json-out workspace/last_bench.json > run.log 2>&1
 ```
 
 Read `run.log` and extract the key metrics:
@@ -101,7 +104,7 @@ This gives you the **direction** of optimization (memory vs. compute), but not t
 After understanding the macro picture, use NCU + ncu-cli to identify the **specific** bottleneck:
 
 ```bash
-uv run tools/ncu_profile.py > ncu.log 2>&1
+uv run tools/ncu_profile.py --mode targeted --output-prefix workspace/ncu_reports/manual_targeted > ncu.log 2>&1
 ```
 
 Extract the key findings:
@@ -113,7 +116,7 @@ grep "ncu_bottleneck\|ncu_top_stall\|ncu_finding\|ncu_action\|ncu_occupancy\|ncu
 For targeted analysis (e.g., memory access patterns, warp stalls):
 
 ```bash
-uv run tools/ncu_profile.py --skills roofline,memory,warp_stall > ncu.log 2>&1
+uv run tools/ncu_profile.py --mode targeted --skills roofline,memory,warp_stall --output-prefix workspace/ncu_reports/manual_targeted > ncu.log 2>&1
 ```
 
 To compare before/after an optimization:
@@ -129,7 +132,7 @@ uv run tools/ncu_profile.py --diff before.csv after.csv > ncu_diff.log 2>&1
 
 ### Step 4: Hypothesize
 
-Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate a **single, focused** hypothesis:
+Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate a **single, focused** hypothesis. Create an `optimization_proposal.md` for the iteration and make sure it contains a `## Strategy tags` section.
 
 > Hypothesis: [What you plan to change and why you expect it to improve performance]
 > Macro evidence: [Which `tools/bench.py` metric(s) indicate the bottleneck direction]
@@ -139,12 +142,13 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 1. **Macro**: `tools/bench.py` roofline → is it compute-bound or memory-bound? How far from peak?
 2. **Micro**: `ncu-cli analyze` → what is the *specific* bottleneck? (stall type, cache miss, uncoalesced access, etc.)
 3. **Knowledge**: Check `CUDA_OPTIMIZATION.md` → does a known optimization address this? The "Cross-Kernel Optimization Patterns" section at the bottom organizes techniques by bottleneck type (e.g., `[register-pressure]`, `[occupancy]`, `[tensor-core]`) for easy lookup regardless of which kernel you're optimizing.
-4. **Docs**: Read relevant files in `docs/` for the specific bottleneck. The `docs/` directory contains curated references on stall reasons, memory optimization, compute optimization, and architecture-specific notes.
+4. **Docs**: Read relevant files in `docs/` for the specific bottleneck. The `docs/` directory contains curated references on stall reasons, synchronization, memory optimization, compute optimization, framework-specific tuning, and architecture-specific notes.
 5. **History**: Check `memory/<kernel_type>.md` → has this been tried before for this kernel?
 
 **Rules:**
 - One change per experiment. Do not combine unrelated optimizations.
 - If you've tried this before (check per-kernel log), try something different.
+- Read the current scope's `blocked` / `preferred` fingerprints before writing the proposal. Do not repeat blocked strategies unless you have new contradictory evidence.
 - Always ground hypotheses in NCU evidence, not guesswork.
 
 ### Step 5: Modify
@@ -184,7 +188,7 @@ uv run tools/bench.py > run.log 2>&1
 **9a. Append to `workspace/results.tsv`:**
 
 ```
-experiment_id	hypothesis	correctness	time_ms	throughput	peak_vram_mb	kept	pct_peak_compute	pct_peak_bandwidth	bottleneck	git_sha	parent_experiment_id	ncu_top_stall	ncu_occupancy	ncu_l1_hit_rate	ncu_l2_hit_rate
+experiment_id	hypothesis	correctness	time_ms	throughput	peak_vram_mb	kept	pct_peak_compute	pct_peak_bandwidth	bottleneck	git_sha	parent_experiment_id	ncu_top_stall	ncu_occupancy	ncu_l1_hit_rate	ncu_l2_hit_rate	strategy_tags	strategy_fingerprint	strategy_outcome	strategy_reason	run_dir	iter_dir	targeted_ncu_report	full_ncu_report
 ```
 
 The extended columns capture micro-architectural context for lineage tracking:
@@ -192,8 +196,21 @@ The extended columns capture micro-architectural context for lineage tracking:
 - `git_sha`: `git rev-parse --short HEAD` for exact reproducibility
 - `parent_experiment_id`: which experiment this was derived from
 - `ncu_top_stall`, `ncu_occupancy`, `ncu_l1_hit_rate`, `ncu_l2_hit_rate`: from `tools/ncu_profile.py` output
+- `strategy_tags`, `strategy_fingerprint`, `strategy_outcome`, `strategy_reason`: from `optimization_proposal.md` + `workspace/strategy_memory/global_strategy_memory.json`
+- `run_dir`, `iter_dir`, `targeted_ncu_report`, `full_ncu_report`: artifact lineage
 
-**9b. Update per-kernel log (`memory/<kernel_type>.md`):**
+**9b. Archive per-iteration artifacts under `workspace/runs/run_xxx/iter_vN/`:**
+
+- `benchmark_result.json`
+- `benchmark.stdout.txt`
+- `benchmark.stderr.txt`
+- `targeted.ncu-rep` and/or `full.ncu-rep`
+- `targeted_summary.txt`, `targeted_details.txt`
+- `full_summary.txt`, `full_details.txt`
+- `optimization_proposal.md`
+- `iteration_summary.md`
+
+**9c. Update per-kernel log (`memory/<kernel_type>.md`):**
 
 Record the detailed experiment for this specific kernel:
 - Experiment ID and hypothesis
@@ -202,13 +219,13 @@ Record the detailed experiment for this specific kernel:
 - Result (kept / reverted) and key observations
 - What you learned that could inform the next experiment
 
-**9c. Update `workspace/MEMORY.md` (global summary):**
+**9d. Update `workspace/MEMORY.md` (global summary):**
 
 Keep a concise cross-kernel summary:
 - Which kernel was optimized and current best speedup
 - High-level insights that transfer across kernels
 
-**9d. Update `CUDA_OPTIMIZATION.md` (if a new optimization pattern was discovered):**
+**9e. Update `CUDA_OPTIMIZATION.md` (if a new optimization pattern was discovered):**
 
 When an optimization **succeeds**, add it to `CUDA_OPTIMIZATION.md` under the appropriate kernel type section. Include:
 - What the optimization is
@@ -221,6 +238,8 @@ When an optimization **succeeds**, add it to `CUDA_OPTIMIZATION.md` under the ap
 Return to Step 1. Continue until:
 - Performance gains have plateaued (< 1% improvement over 3 consecutive experiments)
 - You have exhausted all known optimizations in `CUDA_OPTIMIZATION.md` and cannot generate new hypotheses from NCU data
+
+If `workspace/strategy_memory/global_strategy_memory.json` marks a strategy fingerprint as rejected, avoid repeating it without new evidence.
 
 ## Switching Kernels
 

@@ -54,6 +54,8 @@ Quick-reference for NCU warp stall types, root causes, and mitigations.
 - Balance workload across warps
 - Pipeline: overlap compute of iteration N with loads for iteration N+1
 
+See also: `docs/sync_optimization.md`
+
 ---
 
 ## mio_throttle
@@ -102,6 +104,8 @@ Quick-reference for NCU warp stall types, root causes, and mitigations.
 - Reduce the number of barrier-protected critical sections
 - Use async copy (`cp.async`) with arrive/wait patterns
 
+See also: `docs/sync_optimization.md`
+
 ---
 
 ## membar
@@ -118,6 +122,8 @@ Quick-reference for NCU warp stall types, root causes, and mitigations.
 - Use non-blocking fence variants (acquire/release semantics)
 - Move fence out of inner loops
 - Eliminate branches so compiler can use lighter fence variants (AVO branchless rescaling technique)
+
+See also: `docs/sync_optimization.md`
 
 ---
 

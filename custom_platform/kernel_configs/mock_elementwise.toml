@@ -1,0 +1,24 @@
+[meta]
+multi_output = false
+
+test_dtypes = ["float32"]
+
+[[test_sizes]]
+label = "tiny"
+params = {M = 32, N = 32}
+
+[[test_sizes]]
+label = "small"
+params = {M = 128, N = 128}
+
+[[test_sizes]]
+label = "large"
+params = {M = 256, N = 256}
+
+[tolerances.float32]
+atol = 1e-6
+rtol = 1e-6
+
+[[edge_sizes]]
+label = "edge_irregular"
+params = {M = 17, N = 29}
