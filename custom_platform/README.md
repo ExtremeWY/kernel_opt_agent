@@ -104,8 +104,9 @@ The experiment loop writes:
 
 Use the mock path when you want to validate the workflow itself:
 
-- `python custom_platform/tools/prepare.py --platform mock_platform`
-- `python custom_platform/tools/run_loop.py --platform mock_platform --hypothesis "mock dry run"`
+- `.venv/bin/python custom_platform/tools/prepare.py --platform mock_platform`
+- `.venv/bin/python custom_platform/tools/run_loop.py --platform mock_platform --hypothesis "mock dry run"`
+- If `custom_platform/workspace/runtime_env.md` selects a different interpreter on this machine, use those commands for bench/profile/run_loop.
 
 ## First Step
 

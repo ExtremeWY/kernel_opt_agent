@@ -12,19 +12,42 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from iteration_report import choose_best_iteration, load_manifest, render_final_summary, render_iteration_markdown, save_manifest
-from preflight import collect_preflight, write_preflight_outputs
-from strategy_memory import (
-    build_strategy_fingerprint,
-    classify_strategy_outcome,
-    ensure_scope,
-    extract_strategy_tags,
-    load_global_strategy_memory,
-    merge_strategy_constraints,
-    save_global_strategy_memory,
-    sanitize_token,
-    update_memory_bucket,
-)
+try:
+    from .iteration_report import (
+        choose_best_iteration,
+        load_manifest,
+        render_final_summary,
+        render_iteration_markdown,
+        save_manifest,
+    )
+    from .preflight import collect_preflight, write_preflight_outputs
+    from .runtime import build_python_cmd
+    from .strategy_memory import (
+        build_strategy_fingerprint,
+        classify_strategy_outcome,
+        ensure_scope,
+        extract_strategy_tags,
+        load_global_strategy_memory,
+        merge_strategy_constraints,
+        save_global_strategy_memory,
+        sanitize_token,
+        update_memory_bucket,
+    )
+except ImportError:
+    from iteration_report import choose_best_iteration, load_manifest, render_final_summary, render_iteration_markdown, save_manifest
+    from preflight import collect_preflight, write_preflight_outputs
+    from runtime import build_python_cmd
+    from strategy_memory import (
+        build_strategy_fingerprint,
+        classify_strategy_outcome,
+        ensure_scope,
+        extract_strategy_tags,
+        load_global_strategy_memory,
+        merge_strategy_constraints,
+        save_global_strategy_memory,
+        sanitize_token,
+        update_memory_bucket,
+    )
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE = ROOT / "workspace"
@@ -116,14 +139,13 @@ def _run_bench_to_artifacts(iter_dir: Path, platform: str) -> tuple[int, dict[st
     benchmark_json = iter_dir / "benchmark_result.json"
     stdout_path = iter_dir / "benchmark.stdout.txt"
     stderr_path = iter_dir / "benchmark.stderr.txt"
-    cmd = [
-        sys.executable,
+    cmd = build_python_cmd(
         str(ROOT / "tools" / "bench.py"),
         "--platform",
         platform,
         "--json-out",
         str(benchmark_json),
-    ]
+    )
     result = _run(cmd, timeout=900)
     _write_text(stdout_path, result.stdout or "")
     _write_text(stderr_path, result.stderr or "")
@@ -136,8 +158,7 @@ def _run_profile_to_artifacts(iter_dir: Path, platform: str) -> tuple[int, dict[
     details_path = iter_dir / "profile_details.txt"
     stdout_path = iter_dir / "profile.stdout.txt"
     stderr_path = iter_dir / "profile.stderr.txt"
-    cmd = [
-        sys.executable,
+    cmd = build_python_cmd(
         str(ROOT / "tools" / "profile.py"),
         "--platform",
         platform,
@@ -149,7 +170,7 @@ def _run_profile_to_artifacts(iter_dir: Path, platform: str) -> tuple[int, dict[
         str(summary_path),
         "--details-out",
         str(details_path),
-    ]
+    )
     result = _run(cmd, timeout=1800)
     _write_text(stdout_path, result.stdout or "")
     _write_text(stderr_path, result.stderr or "")

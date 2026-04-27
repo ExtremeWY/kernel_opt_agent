@@ -11,8 +11,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from platforms.registry import get_platform_adapter
-from preflight import collect_preflight, write_preflight_outputs
-from strategy_memory import default_global_strategy_memory
+
+try:
+    from .preflight import collect_preflight, write_preflight_outputs
+    from .runtime import RUNTIME_JSON, RUNTIME_MD, write_runtime_outputs
+    from .strategy_memory import default_global_strategy_memory
+except ImportError:
+    from preflight import collect_preflight, write_preflight_outputs
+    from runtime import RUNTIME_JSON, RUNTIME_MD, write_runtime_outputs
+    from strategy_memory import default_global_strategy_memory
 
 RESULTS_FILE = ROOT / "workspace" / "results.tsv"
 MEMORY_FILE = ROOT / "workspace" / "MEMORY.md"
@@ -114,6 +121,12 @@ def main() -> None:
     init_runs()
     init_strategy_memory()
     init_proposal_template()
+    runtime = write_runtime_outputs(RUNTIME_JSON, RUNTIME_MD)
+    preferred_python = runtime.get("preferred_python", sys.executable)
+    if runtime.get("using_preferred_python"):
+        print(f"runtime: using preferred python {preferred_python}")
+    else:
+        print(f"runtime: current python differs from preferred runtime: {sys.executable} -> {preferred_python}")
 
     if args.skip_preflight:
         adapter = get_platform_adapter(args.platform)
@@ -147,6 +160,8 @@ def main() -> None:
     print(f"proposal_template: {PROPOSAL_TEMPLATE}")
     print(f"preflight_json: {PREFLIGHT_JSON}")
     print(f"preflight_md: {PREFLIGHT_MD}")
+    print(f"runtime_json: {RUNTIME_JSON}")
+    print(f"runtime_md: {RUNTIME_MD}")
 
 
 if __name__ == "__main__":

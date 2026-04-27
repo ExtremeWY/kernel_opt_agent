@@ -19,6 +19,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from .runtime import build_python_cmd
+except ImportError:
+    from runtime import build_python_cmd
+
 
 SKILL_METRICS: dict[str, list[str]] = {
     "roofline": [
@@ -107,9 +112,8 @@ def collect_metrics(skills: list[str]) -> list[str]:
 
 
 def _get_kernel_launch_cmd(kernel_file: str, gpu: int = 0) -> list[str]:
-    repo_root = os.getcwd()
-    return [
-        sys.executable,
+    repo_root = str(Path(kernel_file).resolve().parent)
+    return build_python_cmd(
         "-c",
         f"""
 import importlib.util, os, sys
@@ -139,7 +143,7 @@ for _ in range(3):
     mod.kernel_fn(**inputs)
 torch.cuda.synchronize()
 """,
-    ]
+    )
 
 
 def build_ncu_cmd(

@@ -17,12 +17,18 @@ if str(ROOT) not in sys.path:
 
 from platforms.registry import get_platform_adapter
 
+try:
+    from .runtime import runtime_info
+except ImportError:
+    from runtime import runtime_info
+
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
 def collect_preflight(platform_name: str, kernel_file: Path, allow_placeholder: bool = False) -> dict[str, Any]:
+    runtime = runtime_info(ROOT)
     adapter = get_platform_adapter(platform_name)
     issues = adapter.validate_environment()
     ready = not issues
@@ -41,11 +47,17 @@ def collect_preflight(platform_name: str, kernel_file: Path, allow_placeholder: 
         "ready": ready,
         "platform": platform_name,
         "python_executable": sys.executable,
+        "preferred_python_executable": runtime.get("preferred_python", ""),
+        "runtime_commands": runtime.get("commands", {}),
         "python_version": sys.version.replace("\n", " "),
         "host_platform": platform.platform(),
         "allow_placeholder": allow_placeholder,
         "requirements": requirements,
-        "warnings": issues if allow_placeholder else [],
+        "warnings": (
+            ([ "Current Python differs from the preferred project runtime; use workspace/runtime_env.md commands to avoid uv-run sync hangs." ]
+            if runtime.get("preferred_python") and runtime.get("preferred_python") != sys.executable else [])
+            + (issues if allow_placeholder else [])
+        ),
         "errors": [] if allow_placeholder else issues,
     }
 
@@ -59,8 +71,15 @@ def render_preflight_markdown(preflight: dict[str, Any]) -> str:
         f"- checked at: {preflight.get('checked_at', '')}",
         f"- platform: {preflight.get('platform', '')}",
         f"- python: {preflight.get('python_executable', '')}",
+        f"- preferred python: {preflight.get('preferred_python_executable', '')}",
         f"- python version: {preflight.get('python_version', '')}",
         f"- allow placeholder: {'yes' if preflight.get('allow_placeholder') else 'no'}",
+        "",
+        "## Recommended Commands",
+        f"- prepare: `{(preflight.get('runtime_commands') or {}).get('prepare', '')}`",
+        f"- bench: `{(preflight.get('runtime_commands') or {}).get('bench', '')}`",
+        f"- profile: `{(preflight.get('runtime_commands') or {}).get('profile', '')}`",
+        f"- run loop: `{(preflight.get('runtime_commands') or {}).get('run_loop', '')}`",
         "",
         "## Requirements",
         "",

@@ -8,7 +8,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from preflight import collect_preflight, write_preflight_outputs
+try:
+    from .preflight import collect_preflight, write_preflight_outputs
+    from .runtime import RUNTIME_JSON, RUNTIME_MD, write_runtime_outputs
+except ImportError:
+    from preflight import collect_preflight, write_preflight_outputs
+    from runtime import RUNTIME_JSON, RUNTIME_MD, write_runtime_outputs
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE = ROOT / "workspace"
@@ -155,6 +160,12 @@ def main() -> None:
     init_memory()
     init_run_dirs()
     init_strategy_memory()
+    runtime = write_runtime_outputs(RUNTIME_JSON, RUNTIME_MD)
+    preferred_python = runtime.get("preferred_python", sys.executable)
+    if runtime.get("using_preferred_python"):
+        print(f"[✓] runtime pinned to {preferred_python}")
+    else:
+        print(f"[!] current Python differs from preferred runtime: {sys.executable} -> {preferred_python}")
     print()
     check_kernel_files()
 
@@ -170,6 +181,7 @@ def main() -> None:
         print(f"  Review {PREFLIGHT_MD.relative_to(ROOT)} before running experiments.")
     else:
         print("  Environment ready. Read program.md to begin.")
+    print(f"  Runtime commands: {RUNTIME_MD.relative_to(ROOT)}")
     print("=" * 60)
 
 

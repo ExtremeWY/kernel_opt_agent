@@ -252,7 +252,8 @@ Before implementation, collect these documents from the target hardware vendor:
 3. Replace `kernels/example_op.py` with one real kernel.
 4. Update `kernel_configs/example_op.*` to match the real kernel.
 5. Fill `docs/*.md` with platform terminology and profiler metric mapping.
-6. Run `python custom_platform/tools/prepare.py --allow-placeholder` first, then without the flag after implementation.
+6. Run `.venv/bin/python custom_platform/tools/prepare.py --allow-placeholder` first, then without the flag after implementation.
+   If `custom_platform/workspace/runtime_env.md` selects a different interpreter, use that command instead.
 7. Copy a real kernel to `custom_platform/kernel.py` and run the benchmark/profile loop.
 8. Verify `workspace/runs/run_<timestamp>/` contains complete artifacts and strategy memory updates.
 

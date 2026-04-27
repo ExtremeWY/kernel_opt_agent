@@ -14,18 +14,40 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from iteration_report import choose_best_iteration, load_manifest, render_final_summary, render_iteration_markdown, save_manifest
-from preflight import collect_preflight, write_preflight_outputs
-from strategy_memory import (
-    build_strategy_fingerprint,
-    ensure_scope,
-    extract_strategy_tags,
-    classify_strategy_outcome,
-    load_global_strategy_memory,
-    merge_strategy_constraints,
-    save_global_strategy_memory,
-    update_memory_bucket,
-)
+try:
+    from .iteration_report import (
+        choose_best_iteration,
+        load_manifest,
+        render_final_summary,
+        render_iteration_markdown,
+        save_manifest,
+    )
+    from .preflight import collect_preflight, write_preflight_outputs
+    from .runtime import build_python_cmd
+    from .strategy_memory import (
+        build_strategy_fingerprint,
+        ensure_scope,
+        extract_strategy_tags,
+        classify_strategy_outcome,
+        load_global_strategy_memory,
+        merge_strategy_constraints,
+        save_global_strategy_memory,
+        update_memory_bucket,
+    )
+except ImportError:
+    from iteration_report import choose_best_iteration, load_manifest, render_final_summary, render_iteration_markdown, save_manifest
+    from preflight import collect_preflight, write_preflight_outputs
+    from runtime import build_python_cmd
+    from strategy_memory import (
+        build_strategy_fingerprint,
+        ensure_scope,
+        extract_strategy_tags,
+        classify_strategy_outcome,
+        load_global_strategy_memory,
+        merge_strategy_constraints,
+        save_global_strategy_memory,
+        update_memory_bucket,
+    )
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -132,14 +154,13 @@ def _run_bench_to_artifacts(iter_dir: Path, quick: bool, gpu: int) -> tuple[int,
     benchmark_json = iter_dir / "benchmark_result.json"
     stdout_path = iter_dir / "benchmark.stdout.txt"
     stderr_path = iter_dir / "benchmark.stderr.txt"
-    cmd = [
-        sys.executable,
+    cmd = build_python_cmd(
         str(ROOT / "tools" / "bench.py"),
         "--gpu",
         str(gpu),
         "--json-out",
         str(benchmark_json),
-    ]
+    )
     if quick:
         cmd.append("--quick")
     result = _run(cmd, timeout=900)
@@ -159,8 +180,7 @@ def _run_ncu_mode(
     details_path = iter_dir / f"{output_name}_details.txt"
     stdout_path = iter_dir / f"{output_name}_ncu.stdout.txt"
     stderr_path = iter_dir / f"{output_name}_ncu.stderr.txt"
-    cmd = [
-        sys.executable,
+    cmd = build_python_cmd(
         str(ROOT / "tools" / "ncu_profile.py"),
         "--mode",
         mode,
@@ -178,7 +198,7 @@ def _run_ncu_mode(
         str(stdout_path),
         "--stderr-out",
         str(stderr_path),
-    ]
+    )
     result = _run(cmd, timeout=1800)
     metadata = {
         "command": " ".join(cmd),

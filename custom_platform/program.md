@@ -18,8 +18,9 @@ Each kernel module must export:
 
 ## Setup Phase
 
-1. Run `python tools/prepare.py`.
+1. Run `.venv/bin/python tools/prepare.py`.
    For a local dry run without real hardware, use `--platform mock_platform`.
+   If `workspace/runtime_env.md` selects a different interpreter on this machine, use those commands for all subsequent tool invocations.
 2. Read `knowledge/custom_platform/OPTIMIZATION.md`.
 3. Read `workspace/MEMORY.md`.
 4. Read `workspace/strategy_memory/global_strategy_memory.json`.
@@ -30,7 +31,7 @@ Each kernel module must export:
 
 ## Experiment Loop
 
-1. Run `python tools/run_loop.py --hypothesis "<one focused change>"`.
+1. Run `.venv/bin/python tools/run_loop.py --hypothesis "<one focused change>"`.
    For a full mock success path, use `--platform mock_platform`.
 2. Inspect `workspace/runs/run_<timestamp>/preflight_check.md`.
 3. Read `iter_vN/benchmark_result.json` and `iter_vN/profile_summary.txt`.

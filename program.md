@@ -43,7 +43,8 @@ To add a new kernel, create `kernel_configs/<name>.toml` (sizes, dtypes, toleran
 
 ## Setup Phase
 
-1. Run `uv run tools/prepare.py` to validate the environment (CUDA, GPU, dependencies).
+1. Run `.venv/bin/python tools/prepare.py` to validate the environment (CUDA, GPU, dependencies).
+   If `workspace/runtime_env.md` selects a different interpreter on this machine, use those commands for all subsequent tool invocations.
 2. Review `workspace/preflight_check.md`. If preflight is not ready, fix blocking issues before starting experiments.
 3. Read `CUDA_OPTIMIZATION.md` to review optimization strategies discovered in previous runs. (This file is maintained by you — the agent — and may be empty on the first run.)
 4. Read `workspace/MEMORY.md` for the global optimization summary across all kernels.
@@ -73,13 +74,13 @@ Repeat the following cycle:
 Run the benchmark harness. It auto-detects `KERNEL_TYPE` from `kernel.py` and should emit structured JSON:
 
 ```bash
-uv run tools/bench.py --json-out workspace/last_bench.json > run.log 2>&1
+.venv/bin/python tools/bench.py --json-out workspace/last_bench.json > run.log 2>&1
 ```
 
 For quick iteration (skip numerical stability, determinism, edge cases):
 
 ```bash
-uv run tools/bench.py --quick --json-out workspace/last_bench.json > run.log 2>&1
+.venv/bin/python tools/bench.py --quick --json-out workspace/last_bench.json > run.log 2>&1
 ```
 
 Read `run.log` and extract the key metrics:
@@ -113,7 +114,7 @@ This gives you the **direction** of optimization (memory vs. compute), but not t
 After understanding the macro picture, use NCU + ncu-cli to identify the **specific** bottleneck:
 
 ```bash
-uv run tools/ncu_profile.py --mode targeted --output-prefix workspace/ncu_reports/manual_targeted > ncu.log 2>&1
+.venv/bin/python tools/ncu_profile.py --mode targeted --output-prefix workspace/ncu_reports/manual_targeted > ncu.log 2>&1
 ```
 
 Extract the key findings:
@@ -125,13 +126,13 @@ grep "ncu_bottleneck\|ncu_top_stall\|ncu_finding\|ncu_action\|ncu_occupancy\|ncu
 For targeted analysis (e.g., memory access patterns, warp stalls):
 
 ```bash
-uv run tools/ncu_profile.py --mode targeted --skills roofline,memory,warp_stall --output-prefix workspace/ncu_reports/manual_targeted > ncu.log 2>&1
+.venv/bin/python tools/ncu_profile.py --mode targeted --skills roofline,memory,warp_stall --output-prefix workspace/ncu_reports/manual_targeted > ncu.log 2>&1
 ```
 
 To compare before/after an optimization:
 
 ```bash
-uv run tools/ncu_profile.py --diff before.csv after.csv > ncu_diff.log 2>&1
+.venv/bin/python tools/ncu_profile.py --diff before.csv after.csv > ncu_diff.log 2>&1
 ```
 
 **NCU analysis tells you the *specific* cause:**
@@ -180,7 +181,7 @@ git commit -m "experiment: <brief description of change>"
 ### Step 7: Benchmark
 
 ```bash
-uv run tools/bench.py > run.log 2>&1
+.venv/bin/python tools/bench.py > run.log 2>&1
 ```
 
 **IMPORTANT**: Always redirect to `run.log`. Do NOT let output flood your context window.
@@ -325,7 +326,7 @@ cuda-evolve/
 - **`kernels/`**: Baseline kernels. **Never modify.** These are the starting point and comparison reference.
 - **`kernels_optimized/`**: Mirrors `kernels/` structure. The agent saves the best optimized version of each kernel here after finishing optimization.
 - **`kernel_configs/`**: Per-kernel benchmark configurations. Each kernel has a `.toml` file (declarative data: sizes, dtypes, tolerances) and a companion `.py` file (callables: input generator, reference wrapper, flops/bytes functions). Auto-discovered by `tools/bench.py` at import time. To add a new kernel, create `<name>.toml` + `<name>.py` here.
-- **`tools/`**: Runnable harnesses and helpers. Invoke with `uv run tools/<script>.py`.
+- **`tools/`**: Runnable harnesses and helpers. Invoke with `.venv/bin/python tools/<script>.py` after `uv sync`.
 - **`references/`**: Per-kernel PyTorch reference code for correctness. **Never modify.**
 - **`CUDA_OPTIMIZATION.md`**: Grows over time as the agent discovers what works. Organized by kernel type with tagged entries (e.g., `[register-pressure]`, `[occupancy]`). Includes a "Cross-Kernel Optimization Patterns" section for transferable techniques.
 - **`memory/<kernel_type>.md`**: Detailed per-kernel experiment log with full NCU analysis, hypotheses, and outcomes. This is the primary record for each kernel.
@@ -338,11 +339,11 @@ cuda-evolve/
 
 | Tool | Purpose | Usage |
 |------|---------|-------|
-| `tools/bench.py` | Correctness + performance benchmark | `uv run tools/bench.py > run.log 2>&1` |
-| `tools/ncu_profile.py` | NCU micro-architecture profiling | `uv run tools/ncu_profile.py > ncu.log 2>&1` |
-| `tools/run_loop.py` | Automated experiment cycle | `uv run tools/run_loop.py --hypothesis "..."` |
-| `tools/prepare.py` | Environment validation | `uv run tools/prepare.py` |
-| `tools/merge_results.py` | Merge multi-agent results | `uv run tools/merge_results.py ../worktree` |
+| `tools/bench.py` | Correctness + performance benchmark | `.venv/bin/python tools/bench.py > run.log 2>&1` |
+| `tools/ncu_profile.py` | NCU micro-architecture profiling | `.venv/bin/python tools/ncu_profile.py > ncu.log 2>&1` |
+| `tools/run_loop.py` | Automated experiment cycle | `.venv/bin/python tools/run_loop.py --hypothesis "..."` |
+| `tools/prepare.py` | Environment validation | `.venv/bin/python tools/prepare.py` |
+| `tools/merge_results.py` | Merge multi-agent results | `.venv/bin/python tools/merge_results.py ../worktree` |
 
 ## Multi-Agent Parallel Optimization
 
@@ -375,11 +376,11 @@ Bind each agent to a separate GPU via `CUDA_VISIBLE_DEVICES`:
 ```bash
 # Agent A (matmul) — GPU 0
 cd ../cuda-evolve-matmul
-CUDA_VISIBLE_DEVICES=0 uv run tools/bench.py > run.log 2>&1
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python tools/bench.py > run.log 2>&1
 
 # Agent B (rms_norm) — GPU 1
 cd ../cuda-evolve-rms-norm
-CUDA_VISIBLE_DEVICES=1 uv run tools/bench.py > run.log 2>&1
+CUDA_VISIBLE_DEVICES=1 .venv/bin/python tools/bench.py > run.log 2>&1
 ```
 
 If only **one GPU** is available, agents can edit code in parallel but must **serialize benchmark execution** to avoid VRAM contention and timing interference.
@@ -423,16 +424,16 @@ For faster iteration, use `tools/run_loop.py` to automate Steps 6-9 (commit, ben
 
 ```bash
 # Edit kernel.py with your change, then:
-uv run tools/run_loop.py --hypothesis "increase tile size from 64 to 128"
+.venv/bin/python tools/run_loop.py --hypothesis "increase tile size from 64 to 128"
 
 # With NCU profiling:
-uv run tools/run_loop.py --hypothesis "vectorize loads" --ncu
+.venv/bin/python tools/run_loop.py --hypothesis "vectorize loads" --ncu
 
 # Quick mode (skip correctness stages 3-5):
-uv run tools/run_loop.py --hypothesis "try num_warps=8" --quick
+.venv/bin/python tools/run_loop.py --hypothesis "try num_warps=8" --quick
 
 # Dry run (show what would happen):
-uv run tools/run_loop.py --hypothesis "test change" --dry-run
+.venv/bin/python tools/run_loop.py --hypothesis "test change" --dry-run
 ```
 
 The runner automatically:

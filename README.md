@@ -53,17 +53,20 @@ cuda-evolve/
 uv sync
 
 # Prepare the environment
-uv run tools/prepare.py
+.venv/bin/python tools/prepare.py
+
+# If prepare selects a different runtime on this machine, use the exact
+# commands written to workspace/runtime_env.md for bench/profile/run_loop.
 
 # Add your kernel to kernels/ (see "Adding Your Own Kernels" below)
 # Then select it for optimization:
 cp kernels/your_kernel.py kernel.py
 
 # Run a benchmark
-uv run tools/bench.py
+.venv/bin/python tools/bench.py
 
 # Run an artifact-aware experiment iteration
-uv run tools/run_loop.py --hypothesis "increase tile size" --targeted-ncu --full-ncu
+.venv/bin/python tools/run_loop.py --hypothesis "increase tile size" --targeted-ncu --full-ncu
 
 # Or kick off the agent loop (via your AI agent):
 # "Read program.md and start optimizing the kernel."
@@ -111,7 +114,7 @@ To add a kernel for the agent to optimize:
 4. **Copy to `kernel.py`** and start optimizing:
    ```bash
    cp kernels/your_kernel.py kernel.py
-   uv run tools/bench.py
+   .venv/bin/python tools/bench.py
    ```
 
 ## Requirements

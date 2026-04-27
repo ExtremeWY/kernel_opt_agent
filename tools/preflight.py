@@ -13,6 +13,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+try:
+    from .runtime import runtime_info
+except ImportError:
+    from runtime import runtime_info
+
 ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE = ROOT / "workspace"
 
@@ -127,8 +132,9 @@ def probe_nvidia_smi() -> dict[str, Any]:
     return info
 
 
-def probe_torch_cuda(gpu_index: int) -> dict[str, Any]:
+def probe_torch_cuda(gpu_index: int, python_executable: str | None = None) -> dict[str, Any]:
     info: dict[str, Any] = {
+        "python_executable": python_executable or sys.executable,
         "importable": False,
         "version": "",
         "cuda_version": "",
@@ -140,28 +146,59 @@ def probe_torch_cuda(gpu_index: int) -> dict[str, Any]:
         "selected_sm": "",
         "error": "",
     }
-    try:
-        import torch
-    except Exception as exc:  # pragma: no cover - import path depends on env
-        info["error"] = str(exc)
-        return info
 
+    probe = run_probe(
+        [
+            python_executable or sys.executable,
+            "-c",
+            """
+import json
+import sys
+
+gpu_index = int(sys.argv[1])
+info = {
+    "python_executable": sys.executable,
+    "importable": False,
+    "version": "",
+    "cuda_version": "",
+    "cuda_available": False,
+    "device_count": 0,
+    "selected_gpu_index": gpu_index,
+    "selected_gpu_name": "",
+    "selected_gpu_compute_capability": "",
+    "selected_sm": "",
+    "error": "",
+}
+try:
+    import torch
     info["importable"] = True
     info["version"] = getattr(torch, "__version__", "")
     info["cuda_version"] = getattr(torch.version, "cuda", "") or ""
+    info["cuda_available"] = bool(torch.cuda.is_available())
+    if info["cuda_available"]:
+        info["device_count"] = int(torch.cuda.device_count())
+        if 0 <= gpu_index < info["device_count"]:
+            info["selected_gpu_name"] = torch.cuda.get_device_name(gpu_index)
+            major, minor = torch.cuda.get_device_capability(gpu_index)
+            info["selected_gpu_compute_capability"] = f"{major}.{minor}"
+            info["selected_sm"] = f"sm_{major}{minor}"
+except Exception as exc:
+    info["error"] = str(exc)
+print(json.dumps(info))
+""",
+            str(gpu_index),
+        ]
+    )
+    if probe["returncode"] != 0:
+        info["error"] = trim_output((probe["stderr"] or probe["stdout"]).strip())
+        return info
 
     try:
-        info["cuda_available"] = bool(torch.cuda.is_available())
-        if info["cuda_available"]:
-            info["device_count"] = int(torch.cuda.device_count())
-            if 0 <= gpu_index < info["device_count"]:
-                info["selected_gpu_name"] = torch.cuda.get_device_name(gpu_index)
-                major, minor = torch.cuda.get_device_capability(gpu_index)
-                info["selected_gpu_compute_capability"] = f"{major}.{minor}"
-                info["selected_sm"] = f"sm_{major}{minor}"
-    except Exception as exc:  # pragma: no cover - runtime env dependent
-        info["error"] = str(exc)
-    return info
+        parsed = json.loads(probe["stdout"])
+    except json.JSONDecodeError:
+        info["error"] = trim_output((probe["stdout"] or probe["stderr"]).strip())
+        return info
+    return {**info, **parsed}
 
 
 def collect_preflight(
@@ -174,12 +211,15 @@ def collect_preflight(
     warnings: list[str] = []
     errors: list[str] = []
     requirements: list[dict[str, Any]] = []
+    runtime = runtime_info(ROOT)
 
     preflight: dict[str, Any] = {
         "checked_at": now_iso(),
         "ready": False,
         "python_executable": sys.executable,
         "python_version": sys.version.splitlines()[0],
+        "preferred_python_executable": runtime.get("preferred_python", ""),
+        "runtime_commands": runtime.get("commands", {}),
         "selected_gpu_index": gpu,
         "env_vars": {
             "CUDA_PATH": os.environ.get("CUDA_PATH", ""),
@@ -191,12 +231,17 @@ def collect_preflight(
         "errors": errors,
     }
 
+    if runtime.get("preferred_python") and runtime.get("preferred_python") != sys.executable:
+        warnings.append(
+            "Current Python differs from the preferred project runtime; use workspace/runtime_env.md commands to avoid uv-run sync hangs."
+        )
+
     add_requirement(requirements, errors, "repo root", ROOT.exists(), str(ROOT))
 
     if kernel_file is not None:
         add_requirement(requirements, errors, "kernel file", kernel_file.exists(), str(kernel_file))
 
-    torch_info = probe_torch_cuda(gpu)
+    torch_info = probe_torch_cuda(gpu, preflight["preferred_python_executable"] or None)
     preflight["torch"] = torch_info
     add_requirement(
         requirements,
@@ -270,6 +315,7 @@ def collect_preflight(
 def render_preflight_markdown(preflight: dict[str, Any]) -> str:
     gpu = preflight.get("gpu") or {}
     torch_info = preflight.get("torch") or {}
+    runtime_commands = preflight.get("runtime_commands") or {}
     lines = [
         "# cuda-evolve Preflight",
         "",
@@ -277,8 +323,15 @@ def render_preflight_markdown(preflight: dict[str, Any]) -> str:
         f"- ready: {'yes' if preflight.get('ready') else 'no'}",
         f"- checked at: {preflight.get('checked_at', '')}",
         f"- python: {preflight.get('python_executable', '')}",
+        f"- preferred python: {preflight.get('preferred_python_executable', '')}",
         f"- python version: {preflight.get('python_version', '')}",
         f"- selected gpu index: {preflight.get('selected_gpu_index')}",
+        "",
+        "## Recommended Commands",
+        f"- prepare: `{runtime_commands.get('prepare', '')}`",
+        f"- bench: `{runtime_commands.get('bench', '')}`",
+        f"- ncu profile: `{runtime_commands.get('ncu_profile', '')}`",
+        f"- run loop: `{runtime_commands.get('run_loop', '')}`",
         "",
         "## Required Environment",
         "",
