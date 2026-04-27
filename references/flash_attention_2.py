@@ -31,11 +31,11 @@ def flash_attention_2_ref(
         sm_scale = 1.0 / math.sqrt(q.shape[-1])
 
     return F.scaled_dot_product_attention(
-        q.float(),
-        k.float(),
-        v.float(),
+        q,
+        k,
+        v,
         attn_mask=None,
         dropout_p=0.0,
         is_causal=causal,
         scale=float(sm_scale),
-    ).to(torch.bfloat16)
+    )
