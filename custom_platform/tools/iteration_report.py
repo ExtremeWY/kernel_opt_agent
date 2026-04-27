@@ -38,6 +38,8 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
     strategy = record.get("strategy") or {}
     constraints = strategy.get("constraints") or {}
     profile_metrics = record.get("profile_metrics") or {}
+    guidance = record.get("guidance") or {}
+    kernel_traits = guidance.get("kernel_traits") or {}
     lines = [
         f"# Iteration v{record.get('iteration')}",
         "",
@@ -56,6 +58,16 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
         f"- reason: {strategy.get('reason') or 'not_available'}",
         f"- blocked fingerprints: {', '.join(constraints.get('blocked') or []) or 'none'}",
         f"- preferred fingerprints: {', '.join(constraints.get('preferred') or []) or 'none'}",
+        "",
+        "## Guidance",
+        f"- guidance class: {guidance.get('guidance_class', 'none')}",
+        f"- workload class: {guidance.get('workload_class', 'generic')}",
+        f"- shape regime: {guidance.get('shape_regime', 'unknown')}",
+        f"- optimization recommendation: {guidance.get('optimization_recommendation', 'unknown')}",
+        f"- reasoning: {guidance.get('optimization_reasoning', '')}",
+        f"- effective work items: {kernel_traits.get('effective_work_items', 'n/a')}",
+        f"- accelerator candidate: {kernel_traits.get('accelerator_candidate', 'unknown')}",
+        f"- next steps: {' | '.join(guidance.get('next_steps') or []) or 'none'}",
         "",
         "## Commands",
         f"- benchmark: `{record.get('benchmark_command', '')}`",
@@ -110,16 +122,21 @@ def render_final_summary(manifest: dict[str, Any]) -> str:
         "",
         "## Iterations",
         "",
-        "| Iter | Outcome | Correctness | Kernel median ms | Profile report | Snapshot |",
-        "| --- | --- | --- | ---: | --- | --- |",
+        "| Iter | Outcome | Correctness | Kernel median ms | Guidance | Profile report | Snapshot |",
+        "| --- | --- | --- | ---: | --- | --- | --- |",
     ]
     for item in manifest.get("iterations", []):
         bench = item.get("benchmark_result") or {}
         correctness = bench.get("correctness") or {}
         kernel = bench.get("kernel") or {}
         strategy = item.get("strategy") or {}
+        guidance = item.get("guidance") or {}
+        profile_report = "yes" if item.get("profile_report_exists") else "no"
         lines.append(
-            f"| v{item.get('iteration')} | {strategy.get('outcome', 'pending')} | {correctness.get('passed')} | {kernel.get('median_ms', '-')} | {'yes' if item.get('profile_report_exists') else 'no'} | {item.get('snapshot_file', '-')} |"
+            f"| v{item.get('iteration')} | {strategy.get('outcome', 'pending')} | "
+            f"{correctness.get('passed')} | {kernel.get('median_ms', '-')} | "
+            f"{guidance.get('optimization_recommendation', '-')} | {profile_report} | "
+            f"{item.get('snapshot_file', '-')} |"
         )
     best = manifest.get("best_iteration")
     lines.extend(["", "## Best"])

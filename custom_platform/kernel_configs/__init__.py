@@ -54,6 +54,7 @@ def _build_config(toml_path: pathlib.Path) -> dict[str, Any]:
     if meta.get("multi_output", False):
         cfg["multi_output"] = True
 
+    cfg["meta"] = meta
     cfg["test_sizes"] = _parse_sizes(data["test_sizes"])
     dtype_entries = data.get("test_dtypes", meta.get("test_dtypes"))
     if dtype_entries is None:
@@ -68,6 +69,10 @@ def _build_config(toml_path: pathlib.Path) -> dict[str, Any]:
     cfg["bytes_fn"] = module.bytes_fn
     if hasattr(module, "numerical_stability_cases"):
         cfg["numerical_stability_cases"] = module.numerical_stability_cases
+    if hasattr(module, "optimization_traits"):
+        cfg["optimization_traits"] = module.optimization_traits
+    if hasattr(module, "KERNEL_OPT_CHARACTERISTICS"):
+        cfg["kernel_opt_characteristics"] = getattr(module, "KERNEL_OPT_CHARACTERISTICS")
     return cfg
 
 

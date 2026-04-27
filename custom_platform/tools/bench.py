@@ -19,6 +19,11 @@ if ROOT not in sys.path:
 from platforms.base import PlatformNotImplementedError
 from platforms.registry import get_platform_adapter
 
+try:
+    from .compute_traits import compute_kernel_traits, select_primary_size
+except ImportError:
+    from compute_traits import compute_kernel_traits, select_primary_size
+
 
 def _import_torch():
     import torch
@@ -215,6 +220,9 @@ def _result_payload(
     peak_vram_mb: float,
     bench_time_seconds: float,
     bottleneck: str,
+    primary_size_label: str = "",
+    primary_size: dict[str, Any] | None = None,
+    compute_traits: dict[str, Any] | None = None,
     error: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     peak_compute = float(getattr(device_spec, "peak_tflops_fp16", 0.0) or 0.0)
@@ -239,6 +247,9 @@ def _result_payload(
         "pct_peak_compute": pct_peak_compute,
         "pct_peak_bandwidth": pct_peak_bandwidth,
         "bottleneck": bottleneck,
+        "primary_size_label": primary_size_label,
+        "primary_size": primary_size or {},
+        "compute_traits": compute_traits or {},
         "bench_time_seconds": bench_time_seconds,
         "error": error,
     }
@@ -368,7 +379,7 @@ def main() -> None:
             _write_json_out(args.json_out, payload)
             sys.exit(1)
 
-        label, size = config["test_sizes"][-1]
+        label, size = select_primary_size(config)
         dtype = config["test_dtypes"][0]
         inputs = config["input_generator"](size, dtype, device, seed=42)
         ref_fn = config["reference_fn"]
@@ -392,6 +403,18 @@ def main() -> None:
         arithmetic_intensity = flops / nbytes if nbytes > 0 else 0.0
         ridge_point = (peak_compute * 1e12) / (peak_memory * 1e9) if peak_memory > 0 else 0.0
         bottleneck = "memory_bound" if arithmetic_intensity < ridge_point else "compute_bound"
+        bench_metrics = {
+            "bottleneck": bottleneck,
+            "pct_peak_compute": (throughput_tflops / peak_compute * 100.0) if peak_compute > 0 else 0.0,
+            "pct_peak_bandwidth": (bandwidth_gb_s / peak_memory * 100.0) if peak_memory > 0 else 0.0,
+        }
+        benchmark_compute_traits = compute_kernel_traits(
+            kernel_type,
+            config,
+            size,
+            dtype=dtype,
+            bench_metrics=bench_metrics,
+        )
 
         kernel_stats = {
             "average_ms": kernel_ms,
@@ -418,6 +441,9 @@ def main() -> None:
             peak_vram_mb=peak_vram_mb,
             bench_time_seconds=wall_s,
             bottleneck=bottleneck,
+            primary_size_label=label,
+            primary_size=size,
+            compute_traits=benchmark_compute_traits,
         )
 
         print(f"latency_ms: {kernel_ms:.4f}")
@@ -429,6 +455,10 @@ def main() -> None:
         print(f"peak_compute_tflops: {peak_compute:.3f}")
         print(f"peak_memory_gbps: {peak_memory:.1f}")
         print(f"bottleneck: {bottleneck}")
+        print(f"optimization_recommendation: {benchmark_compute_traits['optimization_recommendation']}")
+        print(f"optimization_reasoning: {benchmark_compute_traits['optimization_reasoning']}")
+        print(f"workload_class: {benchmark_compute_traits['workload_class']}")
+        print(f"shape_regime: {benchmark_compute_traits['shape_regime']}")
         print(f"bench_time_seconds: {wall_s:.1f}")
         print(f"benchmark_size: {label}")
         _write_json_out(args.json_out, payload)

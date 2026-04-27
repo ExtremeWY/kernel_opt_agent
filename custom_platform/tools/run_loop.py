@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .compute_traits import compute_kernel_traits
     from .iteration_report import (
         choose_best_iteration,
         load_manifest,
@@ -34,6 +35,7 @@ try:
         update_memory_bucket,
     )
 except ImportError:
+    from compute_traits import compute_kernel_traits
     from iteration_report import choose_best_iteration, load_manifest, render_final_summary, render_iteration_markdown, save_manifest
     from preflight import collect_preflight, write_preflight_outputs
     from runtime import build_python_cmd
@@ -63,7 +65,8 @@ RESULTS_HEADER = (
     "\tachieved_compute_tflops\tachieved_memory_gbps\tpeak_compute_tflops\tpeak_memory_gbps"
     "\tbottleneck\tgit_sha\tparent_experiment_id\tprofile_top_stall\tprofile_occupancy"
     "\tprofile_l1_hit_rate\tprofile_l2_hit_rate\tstrategy_tags\tstrategy_fingerprint"
-    "\tstrategy_outcome\tstrategy_reason\trun_dir\titer_dir\tprofile_report\n"
+    "\tstrategy_outcome\tstrategy_reason\tguidance_class\toptimization_recommendation"
+    "\trun_dir\titer_dir\tprofile_report\n"
 )
 
 
@@ -285,6 +288,8 @@ def _append_result(record: dict[str, Any]) -> None:
         strategy.get("fingerprint", ""),
         strategy.get("outcome", ""),
         strategy.get("reason", ""),
+        (record.get("guidance") or {}).get("guidance_class", ""),
+        (record.get("guidance") or {}).get("optimization_recommendation", ""),
         record.get("run_dir", ""),
         record.get("iter_dir", ""),
         record.get("profile_report", ""),
@@ -308,6 +313,50 @@ def _decide_keep(record: dict[str, Any], previous_record: dict[str, Any] | None)
             return True, f"improved_{improvement:.2f}_percent"
         return False, f"improvement_{improvement:.2f}_below_threshold"
     return True, "baseline_seed"
+
+
+def _synthesize_guidance(
+    kernel_type: str,
+    benchmark_result: dict[str, Any],
+    profile_metrics: dict[str, str],
+) -> dict[str, Any]:
+    bench_traits = benchmark_result.get("compute_traits") or {}
+    primary_size = benchmark_result.get("primary_size") or {}
+    bench_metrics = {
+        "bottleneck": benchmark_result.get("bottleneck", ""),
+        "pct_peak_compute": benchmark_result.get("pct_peak_compute", 0.0),
+        "pct_peak_bandwidth": benchmark_result.get("pct_peak_bandwidth", 0.0),
+    }
+    merged_traits = dict(bench_traits)
+    merged_traits.update(
+        compute_kernel_traits(
+            kernel_type,
+            {"kernel_opt_characteristics": bench_traits},
+            primary_size,
+            dtype=None,
+            bench_metrics=bench_metrics,
+            profile_metrics=profile_metrics,
+        )
+    )
+
+    guidance = {
+        "guidance_class": merged_traits.get("guidance_class", "needs_profile_evidence"),
+        "shape_regime": merged_traits.get("shape_regime", "unknown"),
+        "workload_class": merged_traits.get("workload_class", "generic"),
+        "optimization_recommendation": merged_traits.get("optimization_recommendation", "needs_profile_evidence"),
+        "optimization_reasoning": merged_traits.get("optimization_reasoning", ""),
+        "next_steps": merged_traits.get("next_steps", []),
+        "kernel_traits": merged_traits,
+    }
+    analysis = {
+        "kernel_type": kernel_type,
+        "bench_bottleneck": benchmark_result.get("bottleneck", ""),
+        "profile_top_stall": profile_metrics.get("profile_top_stall", ""),
+        "profile_compute_util": profile_metrics.get("profile_compute_util", ""),
+        "profile_memory_util": profile_metrics.get("profile_memory_util", ""),
+        "summary": guidance,
+    }
+    return {"analysis": analysis, "guidance": guidance}
 
 
 def run_experiment(
@@ -404,6 +453,7 @@ def run_experiment(
     previous_record = manifest.get("iterations", [])[-1] if manifest.get("iterations") else None
     strategy_tags = extract_strategy_tags(proposal_path)
     strategy_fingerprint = build_strategy_fingerprint(kernel_type or "unknown", strategy_tags)
+    guidance_bundle = _synthesize_guidance(kernel_type, benchmark_result, profile_metrics)
 
     record = {
         "iteration": iteration,
@@ -424,6 +474,8 @@ def run_experiment(
         "profile_expected": profile_expected,
         "profile_report_exists": profile_report_exists,
         "profile_metrics": profile_metrics,
+        "analysis": guidance_bundle["analysis"],
+        "guidance": guidance_bundle["guidance"],
         "git_sha": _git_sha(),
         "parent_experiment_id": previous_record.get("experiment_id", "") if previous_record else "",
         "run_dir": str(run_dir.relative_to(ROOT)),
@@ -449,11 +501,22 @@ def run_experiment(
         record,
         previous_record,
     )
+    scope.setdefault("guidance_history", []).append(
+        {
+            "iteration": iteration,
+            "experiment_id": record["experiment_id"],
+            "guidance_class": record["guidance"].get("guidance_class"),
+            "optimization_recommendation": record["guidance"].get("optimization_recommendation"),
+            "shape_regime": record["guidance"].get("shape_regime"),
+            "workload_class": record["guidance"].get("workload_class"),
+        }
+    )
     manifest["strategy_memory"] = {
         "scope_key": scope_key,
         "positive": scope.get("positive", {}),
         "negative": scope.get("negative", {}),
         "rejected": scope.get("rejected", {}),
+        "guidance_history": scope.get("guidance_history", []),
     }
 
     kept, keep_reason = _decide_keep(record, previous_record)

@@ -85,13 +85,14 @@ def ensure_scope(global_payload: dict[str, Any], scope_key: str, meta: dict[str,
     scopes = global_payload.setdefault("scopes", {})
     scope = scopes.get(scope_key)
     if scope is None:
-        scope = {"meta": meta, "positive": {}, "negative": {}, "rejected": {}}
+        scope = {"meta": meta, "positive": {}, "negative": {}, "rejected": {}, "guidance_history": []}
         scopes[scope_key] = scope
     else:
         scope.setdefault("meta", meta)
         scope.setdefault("positive", {})
         scope.setdefault("negative", {})
         scope.setdefault("rejected", {})
+        scope.setdefault("guidance_history", [])
     return scope
 
 
@@ -165,6 +166,11 @@ def update_memory_bucket(
         "baseline_iteration": previous_record.get("iteration") if previous_record else None,
         "baseline_median_ms": previous_median,
         "current_median_ms": current_median,
+        "shape_regime": ((record.get("guidance") or {}).get("shape_regime")),
+        "guidance_class": ((record.get("guidance") or {}).get("guidance_class")),
+        "workload_class": ((record.get("guidance") or {}).get("workload_class")),
+        "optimization_recommendation": ((record.get("guidance") or {}).get("optimization_recommendation")),
+        "kernel_traits": ((record.get("guidance") or {}).get("kernel_traits") or {}),
     }
 
 
