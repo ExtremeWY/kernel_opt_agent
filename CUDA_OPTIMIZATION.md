@@ -406,6 +406,65 @@ Patterns below are indexed by **bottleneck type** rather than kernel. When the a
 
 **Empirical rule**: For tile counts > ~500 on H100 (132 SMs), non-persistent tends to win due to lower overhead and better L1 locality.
 
+## flash_attention_2 (CUDA C causal attention)
+
+### Characteristics
+
+- Bottleneck: compute-bound on RTX 4070 Ti SUPER, but still far from peak compute
+- Current instruction path: short-sequence path now uses a partial WMMA score-tile implementation, but tensor-core share is still low (`ncu_tensor_core_pct≈0.4%`)
+- Working set behavior: K/V staging is shared-memory resident; dynamic shared memory per CTA is only `16 KB`
+- Main sensitivity observed so far: CTA geometry, shared-memory layout, and staging instruction count all materially affect performance
+
+### Effective Optimizations
+
+1. **Prune causal work before the dot-product loop** (`[algorithmic]` `[sync]`)
+   - Specializing the causal path and stopping tile/inner-loop work before masked future keys cut large-size latency substantially.
+   - Why it works: the previous implementation still computed masked QK/PV work and only replaced the score with `-INF` afterward.
+
+2. **Use sequence-length-aware CTA width** (`[occupancy]` `[launch-config]`)
+   - `WARPS_PER_BLOCK=8` for `seq_len <= 2048`, `WARPS_PER_BLOCK=4` otherwise.
+   - On `large`, occupancy rose from `41.4%` to `82.5%`, and latency improved from `21.11 ms` to `14.26 ms` (~`1.48x`).
+   - Why it works: with `16 KB` dynamic shared memory, CTA residency was capped by shared memory rather than registers. Wider CTAs convert the same `5` resident CTAs/SM into many more active warps and let more query warps reuse each staged K/V tile.
+
+3. **Vectorize K/V global-to-shared staging** (`[vectorized-loads]` `[memory-coalescing]`)
+   - Replacing scalar pair copies with `uint4` vectorized loads/stores on the K/V staging loop improved `large` from `14.41 ms` to `13.06 ms` and `xlarge` from `83.58 ms` to `65.26 ms`.
+   - Why it works: once launch geometry was already tuned, the staging loop became a clearer instruction-count bottleneck. Wider copies reduce per-element address and copy overhead without changing the math path.
+
+4. **Add a short-sequence WMMA score-tile path** (`[tensor-core]` `[mma-shape]` `[tile-size]`)
+   - Switching the `seq_len <= 2048` path to a WMMA-assisted score tile while keeping the existing online softmax and V accumulation improved `large` from `12.80 ms` to `11.77 ms`.
+   - Why it works: even partial tensor-core use reduces scalar dot-product pressure enough to move the kernel forward when the shape regime is MMA-friendly.
+
+5. **Pad WMMA shared-memory rows** (`[cache]` `[memory-access]` `[tensor-core]`)
+   - Padding the WMMA Q/K/V shared-memory pitch improved `large` from `11.77 ms` to `11.45 ms`.
+   - Why it works: the original WMMA layout introduced a bad shared-memory bank pattern. Padding preserved the WMMA structure while dramatically improving L1/shared-memory behavior.
+
+6. **Widen the WMMA key tile and use two score warps** (`[launch-config]` `[tensor-core]` `[tile-size]`)
+   - Expanding the short-sequence WMMA key tile from `16` to `32` improved `large` from `11.45 ms` to `10.86 ms`.
+   - Why it works: a wider score tile amortizes synchronization and staging overhead over more useful QK work, even if occupancy falls somewhat.
+
+7. **Use base-2 online softmax updates** (`[algorithmic]` `[data-type]`)
+   - Replacing `expf` with `exp2f` in the online softmax recurrence improved `large` from `10.86 ms` to `10.46 ms`.
+   - Why it works: the kernel remains compute-bound after the structural WMMA changes, so cheaper exponential updates still matter in the hot loop.
+
+8. **Vectorize WMMA-path Q/K/V staging** (`[vectorized-loads]` `[memory-coalescing]` `[tensor-core]`)
+   - Replacing element-wise WMMA tile staging with `uint4` copies improved `large` from `10.46 ms` to `8.15 ms` and `medium` from `2.74 ms` to `2.09 ms`.
+   - Why it works: after the WMMA path exists, staging overhead becomes a major secondary cost. Vectorized copies slash address-generation and copy instruction count without changing the numerical path.
+
+### Anti-patterns
+
+- **A single fixed wide CTA shape for every sequence length** (`[occupancy]` `[launch-config]`)
+  - Fixed `WARPS_PER_BLOCK=8` improved `medium`/`large`, but regressed `xlarge` badly (`195.59 ms` vs ~`85 ms` baseline-scale).
+  - Reason: the wider CTA is beneficial where occupancy is the main limiter, but it over-shoots on larger sequence lengths. Launch geometry should depend on sequence length, not stay globally fixed.
+- **Shared-memory K/V swizzle on this kernel** (`[memory-access]` `[cache]`)
+  - A swizzled K/V tile layout regressed `large` from `14.41 ms` to `16.66 ms`.
+  - Reason: the extra index arithmetic outweighed any bank-conflict benefit on this small shared-memory footprint.
+- **Bigger short-sequence `BLOCK_N` without evidence of tile-loop overhead** (`[tile-size]` `[launch-config]`)
+  - `BLOCK_N=48` and `BLOCK_N=40` both passed correctness but slightly regressed the kept vectorized-staging version.
+  - Reason: the kernel is still compute-bound and scalar, so larger tiles did not create enough reuse to offset the extra per-CTA work.
+- **CTA widths that violate existing synchronization assumptions** (`[occupancy]` `[launch-config]`)
+  - `WARPS_PER_BLOCK=12` produced `NaN/Inf` in the smoke test even though raw latency improved.
+  - Reason: nontrivial CTA-shape changes can create partial-CTA tails that return before later `__syncthreads()`. Correctness constraints must be checked before trusting faster timings.
+
 ### `[tensor-core]` — Maximizing Tensor Core Utilization
 
 | Technique | Observed impact | Source kernel | Applicability |
