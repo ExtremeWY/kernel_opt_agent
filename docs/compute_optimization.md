@@ -134,6 +134,128 @@ Quick-reference for maximizing compute throughput on NVIDIA GPUs.
 
 ---
 
+## Warp Count / CTA Geometry Strategy
+
+Warp count is part of CTA geometry, not an isolated tuning knob. Choose it
+together with tile shape, per-thread work, register budget, shared-memory
+footprint, and synchronization scope.
+
+Reliable external anchors:
+
+- CUDA Programming Guide and Runtime API: warps are groups of `32` threads;
+  resident blocks and warps depend on registers, shared memory, and launch
+  configuration; occupancy APIs estimate resident blocks from launch geometry
+  and resource use.
+- CUDA Best Practices Guide: higher occupancy does not always mean higher
+  performance; `128-256` threads/block is a reasonable first experimental range
+  for many kernels; several smaller blocks are often better than one large block
+  when `__syncthreads()` latency matters.
+- Nsight Compute Profiling Guide: use Occupancy, SchedulerStats,
+  WarpStateStats, SourceCounters, and stall reasons together. Do not chase stall
+  reasons unless schedulers fail to issue regularly.
+- Triton tutorials and kernels: `num_warps` is autotuned for matmul and
+  attention; persistent softmax derives program count from register pressure and
+  divides by `num_warps`; persistent matmul sweeps `4/8` warps and warns that
+  persistent variants can fail on small shared-memory devices.
+
+Local reference data:
+
+- See `workspace/runs/run_029/warp_count_reference_bench_summary.md`.
+- Hardware: RTX 4070 Ti SUPER, CC 8.9, Triton 3.6.0, PyTorch 2.10.0+cu130.
+- Treat these measurements as directional. They validate rule shape, not
+  universal constants.
+
+### Evidence Map
+
+| Kernel type | Credible source anchors | Local reference data |
+|---|---|---|
+| Streaming / elementwise / copy | CUDA Best Practices thread/block heuristics: warp-multiple block sizes, `128-256` threads/block starting range, and smaller CTAs when block-wide synchronization latency matters. Nsight Compute: `MemoryWorkloadAnalysis`, scheduler issue/eligible warps, and sectors/request identify whether memory access quality or latency hiding is the actual bottleneck. | `workspace/runs/run_029/warp_count_reference_bench.py` triad sweep, summarized in `workspace/runs/run_029/warp_count_reference_bench_summary.md`: `1-8` warps changed throughput only by `~1.4%`. |
+| Row reduction / scan / row softmax | CUDA Best Practices occupancy guidance: active warps hide latency, but higher occupancy is not automatically better. Triton fused softmax tutorial: distributes wide rows across `num_warps`, then derives persistent program count from register/shared-memory occupancy and `num_warps`. | `run_029` row-sum and persistent-softmax sweeps: `1/4` warps were effectively tied for row sum; persistent softmax was almost insensitive to `1-8` warps at the tested row width. |
+| GEMM / MMA / convolution-like dense tiles | Triton matmul tutorial autotunes `num_warps=2/4/8` across tile families; Triton production matmul flags compute `num_warps` from `block_m * block_n`, with a larger floor for persistent kernels. Nsight Compute tensor-pipe and launch-resource sections validate whether a wider tile actually feeds MMA throughput. | `run_029` GEMM sweep: `128x64` was best at `4` warps, while `128x256` required `8` warps to avoid underfeeding the large tile. |
+| Attention / producer-consumer | Triton fused attention tutorial uses tile-dependent `num_warps` and has separate producer/consumer-style paths for newer architectures; Nsight Compute `WarpStateStats`, shared-memory wavefront/conflict counters, and barrier/wait stalls determine whether extra warp groups overlap useful work or only enlarge the synchronization domain. | `run_029` attention-forward reference sweep: `BM=128,BN=32` was best at `4` warps; `2` underfed the tile and `8` added overhead on the tested Ada GPU. |
+| Persistent kernels | CUDA Programming Guide cluster/persistent-style grid-stride guidance ties fixed grid size to SM count and desired occupancy. Triton fused softmax creates persistent programs from `NUM_SM * occupancy`; Triton persistent matmul launches at most an SM-scaled persistent grid and autotunes `4/8` warps. | `run_029` persistent softmax sweep: `1-8` warps were within `~0.5%`, so grid residency and tile ownership were more important than warp count alone. |
+
+### General Decision Rules
+
+1. Start from kernel style, then adjust with NCU. Do not infer the best warp
+   count from occupancy alone.
+2. Prefer multiples of one warp. Avoid partial warps unless the API or layout
+   forces them.
+3. If block-wide barriers are hot, first reduce synchronization scope or split
+   work into smaller CTAs before adding more warps to the same CTA.
+4. If long-scoreboard or no-eligible-warp stalls dominate and resource limits
+   allow more resident warps, increase block count, warp count, or both.
+5. If tensor instructions are the intended main pipeline, pick warp count from
+   MMA tile shape and tensor-core issue needs, then verify register pressure and
+   occupancy.
+6. If LSU/shared-memory instructions dominate and tensor instruction count is
+   already comparable to a reference, reducing warp groups and shared-memory
+   handoff is usually higher leverage than increasing warp count.
+
+### Initial Strategy By Kernel Type
+
+| Kernel type | Initial CTA / warp count | Expand when | Reduce when | Primary NCU checks | Reference evidence |
+|---|---|---|---|---|---|
+| Streaming / elementwise / copy | Start with `128-256` threads/block in CUDA C, or `1-4` Triton warps for one-dimensional blocks. | `long_scoreboard` or no-eligible-warp stalls are high, occupancy is low, and memory accesses are already coalesced. | Bandwidth is saturated, sectors/request are poor, L2 contention rises, or more warps only change noise-level timing. | `dram__throughput`, global load/store sectors, sectors/request, `sm__warps_active`, scheduler issue/eligible metrics. | Local triad: `1-8` warps changed only `~1.4%` (`593-602 GB/s`), so warp-count tuning was secondary to memory access quality. CUDA Best Practices recommends warp-multiple block sizes and `128-256` threads/block as an initial range. |
+| Row reduction / scan / row softmax | Start with `1-4` warps per row/tile. Use more lanes only when row width is large enough to amortize cross-warp reduction. | Wide rows, high per-row reduction latency, low eligible warps, or a single warp has too much serial work. | Register pressure, shared-memory partial reductions, or barrier stalls rise; row width is small enough for warp-local reductions. | `smsp__warps_issue_stalled_short_scoreboard`, `barrier`, `launch__registers_per_thread`, shared wavefront/conflicts, achieved occupancy. | Local row-sum `8192x4096`: `1` and `4` warps were effectively tied; `8` was not better. Triton fused softmax uses `num_warps=8` for wide rows but computes persistent program occupancy as a function of `num_warps`, registers, and shared memory. |
+| GEMM / MMA / convolution-like dense tiles | Start with `4` warps for common `64/128`-sized MMA tiles. Use `2` for small-M/small-N tiles and `8` for large `128x256`, `256x128`, FP8, or high-throughput persistent tiles. | Tensor pipe is underfed, MMA tile is large, or autotuned/open-source references use larger warp groups for the same tile family. | Registers/shared memory cut CTA residency too far, `not_selected` or barrier stalls rise, or smaller tiles already saturate tensor throughput. | `sm__inst_executed_pipe_tensor.sum`, tensor throughput, `launch__registers_per_thread`, `launch__shared_mem_per_block`, occupancy limiters, eligible warps. | Triton matmul autotune spans `2/4/8` warps: small tiles include `2`, mainstream `128x64/128x128` use `4`, and large `128x256`/FP8 configs use `8`. Local GEMM reproduced this: `128x64` best at `4`, while `128x256` needed `8`. |
+| Attention / producer-consumer | Start with `4` warps/block for forward attention-style CTAs on Ampere/Ada unless there is strong evidence for a wider warp-specialized pipeline. | Distinct producer/consumer roles overlap real work, barrier stalls are low, and larger tiles reduce global/shared handoff without excessive registers. | `barrier`, `wait`, shared-memory wavefronts, or LSU instructions dominate; owner/helper warp groups spend time waiting; tensor instruction count already matches reference. | `smsp__warps_issue_stalled_barrier`, `smsp__warps_issue_stalled_wait`, shared load/store wavefronts, shared bank conflicts, LSU instructions, tensor instructions, block size/grid size. | Triton fused attention autotunes `[4,8]` and keeps a reproducible `4`-warp config. Local attention-forward reference: `BM=128,BN=32` was `1.002 ms` at `4` warps, `1.094 ms` at `8`, and `2.670 ms` at `2`. Counterexample pattern: a much wider CTA can match tensor instruction count yet lose to barrier/shared/LSU overhead. |
+| Persistent kernels | Start by choosing persistent grid size from SM count and desired residency, then choose `2-4` warps for reduction/softmax-like persistent kernels or `4-8` for persistent GEMM/TMA tiles. | Each persistent CTA owns a large tile or multiple tiles and has enough independent compute to amortize the persistent scheduler loop. | Too few CTAs leave SMs idle, register/shared-memory budget limits residency, or persistent loop overhead exceeds launch/scheduler savings. | `launch__grid_size`, waves per SM, eligible/active warps, `not_selected`, long scoreboard, register/shared-memory occupancy limits, per-CTA tile count. | Triton fused softmax creates persistent programs from `NUM_SM * occupancy`, where occupancy is divided by `num_warps`. Triton persistent matmul launches at most `NUM_SMS` programs and autotunes `4/8` warps. Local persistent softmax had `1-8` warps within `~0.5%`, so persistent grid/tile sizing mattered more than warp count alone. |
+
+### Anti-Patterns
+
+| Anti-pattern | Why it fails | Better action |
+|---|---|---|
+| Increasing warps because occupancy is low | Occupancy can be low for good reasons: high register reuse, large tensor tiles, or deliberate persistent scheduling. | Inspect eligible warps, issue slots, register pressure, and tensor/LSU mix first. |
+| Using many producer/helper warps without overlap evidence | More warp groups enlarge the synchronization domain and often turn into shared-memory handoff plus barriers. | Prove producer/consumer overlap with NCU; otherwise collapse roles or keep data in registers/warp scope. |
+| Retrying warp-count sweeps after a negative result | Adjacent warp-count variants rarely help unless the tile shape or dataflow changed. | Treat warp count and tile/dataflow as one strategy fingerprint in history. |
+| Choosing `8/16+` warps for small row reductions | Cross-warp reduction and register pressure can exceed saved serial work. | Keep the reduction warp-local or use `1-4` warps until row width justifies expansion. |
+| Treating reference `num_warps` as a copy-paste constant | Reference kernels encode tile shape, stage count, and hardware assumptions. | Match the reference dataflow and tile first; only then compare warp count. |
+
+### Required Evidence Before Changing Warp Count
+
+Record these in the proposal:
+
+- Current and proposed `threads/block`, `warps/block`, grid size, tile shape, and
+  per-thread work.
+- The resource model: registers/thread, shared memory/block, expected CTAs/SM,
+  and resident warps/SM.
+- The bottleneck metric that justifies the change: eligible-warps shortage,
+  long scoreboard, barrier, MIO throttle, tensor pipe underuse, or LSU/shared
+  handoff.
+- The expected dynamic coverage. A warp-count change that only affects tails,
+  boundary tiles, or rare dispatch paths should be rejected unless it is a
+  correctness probe for a larger redesign.
+- At least one reference point: official/open-source kernel configuration,
+  local benchmark sweep, or NCU comparison against a known-good reference.
+
+### Sources
+
+- CUDA Programming Guide, thread hierarchy / occupancy / launch bounds:
+  <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html>
+- CUDA Runtime API occupancy helpers:
+  <https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__OCCUPANCY.html>
+- CUDA Best Practices Guide, occupancy and thread/block heuristics:
+  <https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html>
+- Nsight Compute Profiling Guide, Occupancy, SchedulerStats, WarpStateStats,
+  and stall reasons:
+  <https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html>
+- Triton fused softmax tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html>
+- Triton matrix multiplication tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html>
+- Triton fused attention tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html>
+- Triton persistent matmul tutorial:
+  <https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html>
+- Triton production matmul option flags:
+  <https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/opt_flags_details/opt_flags_nvidia.py>
+- Local benchmark script and raw data:
+  `workspace/runs/run_029/warp_count_reference_bench.py`,
+  `workspace/runs/run_029/warp_count_reference_bench.json`
+
+---
+
 ## Warp Specialization (Advanced)
 
 **What**: Different warp groups within a block perform different roles (producer/consumer pattern).

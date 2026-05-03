@@ -37,10 +37,12 @@ This file should stay compact and navigable. Long-form explanations belong in
 | memory-bound streaming kernel | `docs/memory_optimization.md`, `docs/stall_reasons.md` | `[memory-coalescing]`, `[vectorized-loads]`, `[cache]` |
 | low occupancy | `docs/compute_optimization.md`, `docs/triton_optimization.md` | `[occupancy]`, `[register-pressure]`, `[launch-config]` |
 | high register count / spills | `docs/compute_optimization.md`, `docs/triton_optimization.md` | `[register-pressure]`, `[tile-size]` |
+| warp-count / CTA-geometry mismatch | `docs/compute_optimization.md`, `docs/sync_optimization.md` | `[warp-count]`, `[cta-geometry]`, `[launch-config]`, `[sync]` |
 | barrier / wait / fence stalls | `docs/sync_optimization.md`, `docs/stall_reasons.md` | `[sync]`, `[warp-divergence]`, `[algorithmic]` |
 | poor L1 / L2 reuse | `docs/memory_optimization.md`, `docs/arch_notes.md` | `[cache]`, `[memory-access]`, `[tile-order]` |
 | branch-heavy hot loop | `docs/compute_optimization.md`, `docs/sync_optimization.md` | `[warp-divergence]`, `[algorithmic]` |
 | architecture-specific async copy or pipeline issue | `docs/arch_notes.md`, `docs/memory_optimization.md`, `docs/sync_optimization.md` | `[pipeline]`, `[memory-access]`, `[launch-config]` |
+| low-ceiling prototype / repeated local polish | `docs/prototype_ladder.md`, `docs/strategy_memory.md` | `[prototype-ladder]`, `[design-boundary]`, `[architecture-route]`, `[register-dataflow]` |
 
 ### By Kernel Style
 
@@ -49,7 +51,7 @@ This file should stay compact and navigable. Long-form explanations belong in
 | Triton elementwise / reduction | `docs/triton_optimization.md`, `docs/memory_optimization.md` | coalescing, tile width, occupancy |
 | Triton GEMM / attention | `docs/triton_optimization.md`, `docs/compute_optimization.md`, `docs/sync_optimization.md` | tensor-core path, tile size, registers, stages |
 | CUTLASS GEMM / conv | `docs/cutlass_optimization.md`, `docs/compute_optimization.md`, `docs/memory_optimization.md` | tile shape, stage count, schedule, epilogue |
-| CUDA C custom kernel | `docs/compute_optimization.md`, `docs/memory_optimization.md`, `docs/sync_optimization.md` | launch config, shared memory, warp primitives |
+| CUDA C custom kernel | `docs/compute_optimization.md`, `docs/memory_optimization.md`, `docs/sync_optimization.md` | launch config, warp-count/CTA geometry, shared memory, warp primitives |
 
 ### By Architecture Feature
 
@@ -73,8 +75,11 @@ The repository uses short reusable tags in experiment notes and this guide.
 | `[mma-shape]` | MMA tile fill, padding overhead, and tensor-core shape suitability | `docs/compute_optimization.md`, `docs/arch_notes.md` |
 | `[small-m]` | small-M regimes where MMA tile fill is poor | `docs/compute_optimization.md` |
 | `[compare-cuda-vs-tc]` | explicit comparison of CUDA-core and tensor-core-with-padding paths | `docs/compute_optimization.md` |
+| `[register-dataflow]` | keeping hot intermediates in registers or warp scope instead of materializing them through shared/global memory | `docs/compute_optimization.md`, `docs/sync_optimization.md` |
 | `[register-pressure]` | registers per thread, spills, occupancy limit | `docs/compute_optimization.md` |
 | `[occupancy]` | active warps / blocks per SM | `docs/compute_optimization.md` |
+| `[warp-count]` | warps/block, producer/consumer warp groups, and per-CTA synchronization domain | `docs/compute_optimization.md`, `docs/sync_optimization.md` |
+| `[cta-geometry]` | block geometry, tile ownership, and CTA-level work granularity | `docs/compute_optimization.md`, `docs/memory_optimization.md` |
 | `[tile-size]` | tile shape, block geometry, MMA decomposition | `docs/triton_optimization.md`, `docs/cutlass_optimization.md` |
 | `[launch-config]` | persistent vs non-persistent, block count, grid mapping | `docs/triton_optimization.md`, `docs/compute_optimization.md` |
 | `[memory-coalescing]` | load/store access quality | `docs/memory_optimization.md` |
@@ -86,6 +91,9 @@ The repository uses short reusable tags in experiment notes and this guide.
 | `[sync]` | barrier, wait, fence, pipeline protocol | `docs/sync_optimization.md` |
 | `[data-type]` | precision path, accumulator type, conversion cost | `docs/compute_optimization.md` |
 | `[pipeline]` | async copy depth, producer / consumer overlap | `docs/memory_optimization.md`, `docs/sync_optimization.md` |
+| `[prototype-ladder]` | classifying the current implementation stage before choosing local tuning versus structural route work | `docs/prototype_ladder.md` |
+| `[design-boundary]` | evidence that the current dataflow or primitive has a hard ceiling and needs a route change | `docs/prototype_ladder.md`, `docs/strategy_memory.md` |
+| `[architecture-route]` | multi-sub-iteration structural redesign governed by route invariant, promotion gate, and finite budget | `docs/prototype_ladder.md`, `docs/architecture_route_plan_template.md` |
 
 ---
 
@@ -97,15 +105,26 @@ The repository uses short reusable tags in experiment notes and this guide.
 2. check whether the active shape regime is MMA-friendly or small-M / decode-like
 3. only then inspect tensor-core path and tensor-core instruction share
 4. inspect tile shape and data type
-5. inspect registers per thread and achieved occupancy
-6. only then try deeper pipeline, warp specialization, or epilogue fusion
-7. estimate dynamic coverage before selecting an experiment: if the change only
+5. inspect warp-count / CTA geometry against the kernel style table in
+   `docs/compute_optimization.md`
+6. inspect registers per thread and achieved occupancy
+7. only then try deeper pipeline, warp specialization, or epilogue fusion
+8. estimate dynamic coverage before selecting an experiment: if the change only
    affects boundary tiles, tail predicates, diagonal tiles, or rare shape cases,
    compute the maximum end-to-end speedup and skip it when the estimate is near
    benchmark noise or below the keep threshold
-8. if the dominant gap is structural, such as low tensor-core utilization on an
+9. if the dominant gap is structural, such as low tensor-core utilization on an
    MMA-friendly compute-bound kernel, prioritize redesigns that move the main
    FLOPs onto the right pipeline before local layout/load/barrier polishing
+10. if reference profiling, self-profile trends, source attribution, or a
+    first-principles performance model shows much higher total instructions,
+    LSU/shared-memory handoff, synchronization, main-loop trip count, or grid
+    work than the minimum required work, treat the current kernel as
+    design-boundary limited. Stop local polish and choose a route that removes
+    the dominant dataflow boundary.
+11. scope negative evidence carefully. A failed partial bypass that still keeps
+    the old intermediate or duplicates expensive work does not disprove a full
+    register/ownership redesign that removes the old boundary.
 
 Read first:
 
@@ -135,6 +154,129 @@ valid only when the specialized property is part of the operator contract or a
 documented production invariant. Runtime tile-state checks are acceptable when
 they preserve correctness and performance portability across all supported
 problem sizes.
+
+### Architecture-Route Triage
+
+Use route-level triage when the evidence says the implementation design, not a
+local instruction site, is the limiter.
+
+Start an architecture route when:
+- a reference kernel has similar DRAM traffic but far lower instruction count,
+  shared-memory handoff, synchronization, or launched work
+- no strong reference exists, but the performance model and current-kernel NCU
+  show the same kind of structural excess versus the minimum required work or a
+  primitive ceiling
+- source attribution points to an intermediate or handoff that appears across
+  the steady-state hot path
+- several local variants around the same handoff have become sub-threshold or
+  negative
+- the best-case speedup from removing the boundary is several times larger than
+  the normal keep threshold
+
+Rules for route execution:
+- write a route invariant before editing, such as removing a materialized
+  intermediate, changing producer/consumer ownership, or moving the dominant
+  operation to the intended hardware pipeline
+- allow a finite number of focused sub-iterations for correctness races,
+  synchronization repair, resource rebalance, and tile geometry
+- do not abandon the route because the first version is wrong or slower if the
+  failure still carries the old bottleneck or is a repairable implementation
+  issue
+- mark the broader route negative only after a version that actually satisfies
+  the route invariant has been validated and still cannot beat the old design
+
+Execution support:
+- Use `tools/run_loop.py --architecture-route` for route sub-iterations.
+- When a kernel is design-boundary limited, mark it with
+  `tools/run_loop.py --mark-design-boundary --state-only`. While this marker is
+  active, the runner rejects normal local experiments unless
+  `--allow-local-after-boundary` is passed with explicit justification.
+- New architecture routes under an active design-boundary marker must provide a
+  `--route-plan` containing at least two structurally distinct candidate routes.
+- Non-validation route failures are recorded as `inconclusive`, not as blocked
+  negative evidence. This preserves route budget for correctness, synchronization,
+  and resource-rebalance repairs. The runner exits successfully for these
+  non-validation inconclusive sub-iterations so route execution can continue.
+- Use `--route-allow-regression` only for correctness-passing prototypes that
+  need to remain as the base for the next route sub-iteration. Final validation
+  must use normal keep/revert criteria.
+
+Anti-pattern:
+- repeatedly applying pitch, padding, cache, launch-bound, or branch-shape
+  changes to a design whose dominant intermediate is already known to be the
+  bottleneck
+
+### No-Strong-Reference Workflow
+
+When there is no high-performance black-box or source reference, replace
+reference-gap reasoning with explicit upper-bound reasoning:
+
+1. Record the operator contract: stable dtype/layout/semantic dimensions versus
+   runtime-variable sizes and flags.
+2. Compute required FLOPs, required bytes, loop trip counts, reductions, and
+   synchronization lower bounds for each shape regime.
+3. Estimate primitive ceilings from hardware peak, local microbenchmarks, or
+   minimal prototypes: copy bandwidth, shared-memory staging, reduction,
+   scalar compute, and MMA throughput as applicable.
+4. Profile the current kernel and attribute the largest dynamic costs to source
+   regions: total instructions, LSU/shared instructions, barriers/waits, spills,
+   and memory sectors/request.
+5. Generate multiple architecture-route invariants before editing. Each route
+   must name the structural cost it removes and the dynamic-work fraction it
+   covers.
+6. Run minimal prototypes to falsify route invariants. Do not require the first
+   prototype to beat the incumbent unless it is the route validation step.
+7. Mark a route negative only after a version that actually satisfies the
+   invariant is correct, stable, resource-balanced, and still below threshold.
+
+This prevents the optimizer from treating the first correctness-passing kernel
+as the only viable neighborhood.
+
+### Prototype-Ladder Workflow
+
+The local `manual_cuda_kernel` project is a useful case study for how expert
+CUDA kernels are usually improved: the first large gains come from moving to the
+right prototype stage, and the final gains come from local tuning only after the
+stage is near its ceiling.
+
+Use `docs/prototype_ladder.md` before proposing a local edit when the current
+kernel is still far from a model or reference:
+
+1. Classify the current implementation stage: ownership, data locality,
+   hot-state residency, hardware primitive, layout, pipeline, grid scheduling,
+   or local cleanup.
+2. Name the next missing high-upside stage and estimate its dynamic coverage.
+3. If that stage affects the steady-state hot path and has multi-percent
+   end-to-end payoff, open an architecture route instead of tuning nearby
+   address arithmetic, padding, cache hints, launch bounds, or predicates.
+4. Treat the route as unproven until a correctness-passing, resource-balanced
+   implementation actually satisfies the route invariant.
+5. Scope negative evidence narrowly: a failed padding variant does not disprove
+   a layout route, a bad first pipeline does not disprove all pipelines, and a
+   partial graft that keeps the old hot intermediate does not disprove a
+   residency/ownership redesign.
+
+Manual case-study lessons that should transfer:
+
+- **Matmul progression**: naive/low-level baseline -> CTA/warp/thread tiling ->
+  register tiling -> vectorized memory -> layout/pipeline. Do not start by
+  polishing bounds checks while the tiling hierarchy is wrong.
+- **Tensor-core progression**: choose the intended primitive, then design staged
+  layout around that primitive. Swizzle can be a different route from padding,
+  not just a small variant of it.
+- **Reduction progression**: fix algorithmic parallelism first, then reduce
+  communication scope with warp-level primitives, then vectorize.
+- **Attention-style dense-dot progression**: the first serious prototype should
+  already target high-ceiling compute primitives and keep hot intermediates in
+  register or warp ownership where possible; shared-memory materialization of
+  steady-state intermediates is a design-boundary candidate, not just a bank
+  conflict to tune around.
+- **Pipeline progression**: record in-flight stages, buffer lifetime, wait
+  discipline, synchronization scope, and resource budget. Pipelining can lose if
+  it increases pressure more than it overlaps useful work.
+- **Shape-regime progression**: split work, tile order, and persistent scheduling
+  routes must state the shape regime they target. A route that wins for one
+  regime is not automatically valid for all runtime-variable sizes.
 
 ### Memory-Bound Playbook
 
@@ -442,12 +584,16 @@ Patterns below are indexed by **bottleneck type** rather than kernel. When the a
 ### Characteristics
 
 - Bottleneck: compute-bound on RTX 4070 Ti SUPER, but still far from peak compute
-- Current instruction path: short-sequence path now uses a partial WMMA score-tile implementation, but tensor-core share is still low (`ncu_tensor_core_pct≈0.4%`)
-- Working set behavior: K/V staging is shared-memory resident; dynamic shared memory per CTA is only `16 KB`
+- Current instruction path: QK score generation and full-prefix PV both use
+  partial WMMA paths, but tensor-core share is still low
+  (`ncu_tensor_core_pct≈2.0%`)
+- Working set behavior: K/V staging plus score/probability/PV handoff are
+  shared-memory resident; after run_022 the active WMMA path uses about
+  `32.8 KB` dynamic shared memory per CTA
 - Main sensitivity observed so far: CTA geometry, shared-memory layout, and staging instruction count all materially affect performance
-- Current plateau after `run_012`: `large≈3.22-3.25 ms`, `21.2-21.3 TFLOPS`,
+- Current plateau after `run_015`: `large≈2.86-2.87 ms`, `≈24.0 TFLOPS`,
   `compute_bound`, occupancy already high (`≈82.8%`), and tensor-core
-  instruction share still low (`≈2.1%`). The remaining gap is structural:
+  instruction share still low (`≈2.0%`). The remaining gap is structural:
   QK score generation and full-tile PV are now partially WMMA, but the path
   still materializes scores/probabilities through shared memory and leaves
   boundary/update work outside tensor cores.
@@ -458,6 +604,128 @@ Patterns below are indexed by **bottleneck type** rather than kernel. When the a
   writes are not conflict sources. Future bank-conflict work must therefore
   target the PV WMMA-A/probability dataflow or accumulator store/readback path,
   not K/V pitch or generic shared-memory padding.
+- `run_015` resolved the dominant PV probability A-load conflict by manually
+  constructing the WMMA probability fragment from shared memory. Targeted shared
+  bank conflicts fell from the prior `~169.8M` aggregate signal to `62.0M`,
+  then to `45.9M` after padding only the PV accumulator scratch pitch to `68`.
+- `run_017` tested the next local neighborhoods against source-line evidence:
+  worker-warp merging, reduced staging parallelism, fallback-control sinking,
+  isolated loop-ending barrier removal, and PV scratch `float2` readback. None
+  cleared the keep threshold; the best was only `+0.49%`. The remaining gap is
+  therefore not a local readback/sync/layout problem under the current design.
+- `run_018` found a remaining CTA-geometry win by reducing owner warps from
+  `16` to `8`, with each owner warp split into two 16-lane row groups. Final
+  full benchmark reached `large=2.7384 ms`, `25.107 TFLOPS`. More aggressive
+  `4`-owner-warp packing regressed, so this dataflow needs at least 16 lanes
+  per active query row.
+- `run_019` profiled the run_018 best against the PyTorch fused FlashAttention
+  reference. Current is still `3.11x` slower on `large`
+  (`2.7268 ms` vs `0.8769 ms`). The run_018 change reduced total instructions
+  versus run_016 by `23%`, but current remains `7.16x` above reference in total
+  instructions, `10.74x` above reference in LSU instructions, and has
+  `92.7M` shared store wavefronts versus reference `0.289M`. The next route is
+  therefore register/worker-owned PV accumulation and larger CTA dataflow, not
+  occupancy tuning or local shared-memory pitch/readback variants.
+- `run_020` validated the first part of that route. Full-prefix PV worker
+  accumulators are now kept in registers across full-prefix tiles and imported
+  into owner accumulators only once before fallback. Final validation reached
+  `large=2.6535 ms`, `25.910 TFLOPS`, correctness `PASS`. Targeted NCU moved
+  shared load wavefronts `127.7M -> 99.3M`, shared store wavefronts
+  `92.7M -> 79.7M`, bank conflicts `62.3M -> 39.9M`, and LSU instructions
+  `150.7M -> 142.1M`.
+- `run_021` found one remaining high-coverage owner-path duplication: each
+  owner lane read the same full-prefix score values once for row max and again
+  for probability/sum. Caching those four scores in registers improved final
+  validation to `large=2.5966 ms`, `26.478 TFLOPS`, with shared load
+  wavefronts `99.3M -> 91.1M` and shared load bank conflicts
+  `10.5M -> 6.4M`.
+- `run_022` found a larger resource/dataflow win by reusing a single shared
+  operand tile for K then V. Dynamic shared memory dropped
+  `45888 B -> 28480 B`, shared-memory residency moved from 2 to 3 CTAs/SM, and
+  achieved occupancy rose `49.6% -> 74.1%`. A follow-up widened the PV handoff
+  scratch enough to import both persistent PV accumulator phases in one round
+  while preserving 3 CTAs/SM. Final validation reached `large=2.2611 ms`,
+  `30.407 TFLOPS`.
+- `run_023` exhausted the adjacent post-run_022 local neighborhoods. Scratch
+  aliasing (`+0.38%`) and approximate `ex2` (`+0.11%`) were below threshold;
+  direct global K/V WMMA operands, forced launch bounds, first-tile PV direct
+  assignment, PV import phase reshaping, and `__ldg` vector staging all
+  regressed. Final validation of the unchanged best measured
+  `large=2.2567 ms`, `30.466 TFLOPS`, with targeted NCU still compute-bound,
+  occupancy `74.1%`, dynamic shared memory `32832 B`, and tensor-core share
+  `2.4%`.
+- `run_024` confirmed the remaining gap is not solved by direct standard-WMMA
+  structural translations. A `64x64 / 4-warp` CTA prototype passed correctness
+  but regressed to `large=4.7008 ms` because `2` lanes per row and large
+  per-warp PV accumulator state outweighed lower grid/KV-staging counts. A
+  probability-materialization bypass that recomputed probability fragments in
+  worker warps also passed correctness but regressed to `large=2.7766 ms`.
+  Future score/probability/PV bypass work must avoid both shared
+  materialization and duplicate exponent/register pressure, likely requiring a
+  lower-level MMA/register pipeline rather than another standard-WMMA patch.
+- `run_025` continued with CUDA-only structural probes. Key-segment partial PV
+  output, reusing score/PV worker warps as owner rows, worker-side probability
+  production directly from QK fragments, and simple full-prefix `cp.async`
+  staging all passed correctness but regressed. The current standard-WMMA
+  design relies on overlap between owner probability generation and worker
+  V-staging; moving that work to workers or adding cross-warp partial-output
+  reductions lengthens the critical path.
+- `run_026` ran 20 CUDA-only iterations and kept no source change. The best
+  restored validation was `large=2.2527 ms`. Standard-WMMA M64/M32 larger-query
+  CTA branches were improved substantially from the prior M64 prototype but
+  still plateaued at `3.0788 ms` / `3.0523 ms`, far slower than the current M16
+  dataflow. Manual score stores, `N=128`, 8-worker PV, named barriers,
+  padding-zero removal, output-store packing, diagonal masked PV-WMMA,
+  owner-warp expansion, worker-side probability materialization, and shared/cache
+  hints all failed or stayed below threshold. The remaining credible route is a
+  true lower-level CUDA MMA/register mainloop rewrite with explicit fragment
+  ownership; do not continue standard-WMMA CTA-size, owner/worker, padding,
+  sync, or cache-hint variants without new contradictory NCU evidence.
+- `run_027` tested that lower-level CUDA route for 20 iterations. Explicit
+  BF16 `mma.sync.m16n8k16` QK and PV primitives were made correct, including
+  the required non-transposed B `ldmatrix` direction for the staged K layout.
+  However, QK-only explicit MMA still regressed because scores remained
+  materialized to shared memory. The best inline-PV/worker-direct-output branch
+  reached only quick `large=2.3863 ms` and used `80` registers/thread versus
+  baseline `56`, losing the 3-CTA/SM residency that made the current best
+  viable. Launch bounds, direct persistent accumulation, unroll limiting,
+  worker output packing, 4-owner-warps, probability/shared pitch variants, and
+  hybrid standard-WMMA-prefix + inline-diagonal output all regressed. The
+  conclusion is to block local inline-MMA grafts onto the current M16 CTA; a
+  future attempt must redesign the whole mainloop/ownership model while keeping
+  register usage near the baseline budget.
+- `run_031` found the first successful post-M16 structural redesign:
+  `BM32/BN64/8-warp` row-group mainloop. Four contiguous warps own each
+  16-row group, compute four score-column WMMA tiles in parallel, split
+  softmax rows, and keep two value-tile PV accumulators per warp. Score and
+  probability reuse one shared region with `scorePitch=68` and `probPitch=136`.
+  Final full benchmark reached `large=2.0390 ms`, `medium=0.5964 ms`,
+  `xlarge=7.6669 ms`, correctness PASS. This is the preferred base for the
+  next stage.
+- Negative run_031 evidence: direct BM64 row-group is blocked despite lower
+  CTA count; best BM64 quick was only `2.7175 ms`. BM32 depends on K/V operand
+  pitch `136`; pitch `128` and `144` regressed. Score/prob pitches `76/152` and
+  `80/160`, launch bounds, and split-Q pitch `128` also regressed. Do not
+  continue blind pitch sweeps; use NCU source attribution before local layout
+  work.
+- `run_035` corrected the previous route-selection mistake. The successful
+  route was not another shared-memory score/probability layout. It kept QK
+  score fragments and probability fragments in registers while preserving
+  Tensor Core PV. The final active regtc kernel uses `BLOCK_Q=128`,
+  `BLOCK_KV=16`, `HEAD_DIM=128`, and `8` warps. Full benchmark reached
+  `medium=0.4297 ms`, `large=1.3911 ms`, `xlarge=4.9442 ms`, correctness PASS.
+- Transferable run_035 lesson: do not treat failures inside the old
+  shared-materialization design as proof that a register-owned redesign is
+  invalid. Earlier negative results mostly tested partial bypasses that still
+  carried the old intermediate, duplicated exponent work, or grafted lower-level
+  MMA onto the old ownership model. The successful route changed the
+  dataflow boundary first, then tuned resource balance.
+- Run_035 kept changes: shrink the key/value tile to reduce live register
+  fragments, fix operand-tile reuse races instead of abandoning the route,
+  split K and V shared operand tiles when the saved barrier/instruction cost
+  exceeded the lower CTA residency, and only then raise query tile size to
+  reduce grid/KV repetition. Rejected follow-ups include shared pitch `128`,
+  forced launch bounds, `BLOCK_Q=256`, and padding-zero removal.
 
 ### Effective Optimizations
 
@@ -503,8 +771,169 @@ Patterns below are indexed by **bottleneck type** rather than kernel. When the a
    - Splitting K/V staging into a branch-free full-prefix path improved `large` from `3.3257 ms` to a best observed `3.2227 ms`; promotion validation measured `3.2473 ms`.
    - Why it works: benchmarked causal shapes spend most tile iterations in full-prefix tiles where all 64 K/V rows are active. Removing inactive-row checks and zeroing from that hot staging loop trims repeated control/copy overhead without changing the WMMA operand layout.
 
+11. **Manually construct the PV probability WMMA A fragment** (`[bank-conflict]` `[pv-path]` `[manual-fragment]` `[tensor-core]`)
+   - Replacing standard `wmma::load_matrix_sync` for the PV probability A
+     operand with explicit per-lane fragment loads improved `large` from
+     `3.2487 ms` to `2.9190 ms` in run_015 (`+11.3%`).
+   - Source-line NCU confirmed that the new manual probability load path has
+     `0` excessive shared wavefronts, eliminating the previously dominant
+     source-attributed conflict from the standard WMMA A-load helper.
+   - Why it works: the kernel still uses WMMA for compute, but avoids the
+     shared-memory access pattern generated by the standard WMMA A load for the
+     materialized probability tile.
+
+12. **Pad only the PV accumulator scratch pitch after the probability fix** (`[bank-conflict]` `[pv-path]` `[scratch-layout]`)
+   - Changing the PV scratch leading dimension from `64` to `68` floats after
+     the manual probability fragment change improved `large` from `2.9190 ms`
+     to `2.8615 ms` and reduced targeted shared bank conflicts from `62.0M` to
+     `45.9M`.
+   - Why it works: once the probability A-load conflict is removed, the
+     accumulator store/readback path becomes the remaining high-coverage shared
+     handoff. The pitch change is narrow and preserves the WMMA accumulator
+     store mapping.
+
+13. **Reduce owner warps with half-warp row ownership** (`[owner-warps]` `[cta-geometry]` `[dataflow]`)
+   - Reducing WMMA owner warps from `16` to `8` and assigning two query rows per
+     owner warp with two 16-lane groups improved run_018 `large` from
+     `2.8777 ms` to `2.7427 ms`; final full validation measured
+     `large=2.7384 ms`, `25.107 TFLOPS`.
+   - Why it works: this removes excessive owner-warp/thread overhead while
+     preserving the four score/PV worker warps and the existing MMA
+     decomposition. It is a structural CTA reduction, not a local readback or
+     synchronization tweak.
+
+14. **Keep full-prefix PV accumulators in worker registers** (`[pv-path]` `[dataflow]` `[shared-memory]`)
+   - Moving full-prefix PV accumulation into score/PV worker-warp registers and
+     importing the accumulated result into owner warps only once before fallback
+     improved the run_020 full benchmark to `large=2.6535 ms`,
+     `25.910 TFLOPS`.
+   - NCU confirmed the mechanism: shared load wavefronts dropped from `127.7M`
+     to `99.3M`, shared store wavefronts from `92.7M` to `79.7M`, bank
+     conflicts from `62.3M` to `39.9M`, and LSU instructions from `150.7M` to
+     `142.1M`.
+   - Why it works: it removes repeated per-full-tile
+     `PV WMMA -> shared scratch -> owner readback` handoff without introducing
+     a larger shared accumulator.
+
+15. **Cache owner score values between full-prefix max and probability passes** (`[score-tile]` `[shared-memory]` `[owner-path]`)
+   - The owner row-stat path used to read each full-prefix QK score once during
+     the max pass and again during the probability/sum pass. Keeping each
+     lane's four score values in registers improved run_021 final validation to
+     `large=2.5966 ms`, `26.478 TFLOPS`.
+   - NCU confirmed the mechanism: total instructions dropped
+     `640.0M -> 632.9M`, shared load wavefronts `99.3M -> 91.1M`, shared load
+     bank conflicts `10.5M -> 6.4M`, while registers/thread stayed at `56`.
+   - Why it works: it removes a high-coverage duplicate shared read without
+     changing the score tile layout or increasing CTA resource residency.
+
+16. **Reuse one shared operand tile for K then V** (`[shared-memory]` `[occupancy]` `[staging]` `[dataflow]`)
+   - K and V are not simultaneously live in the current WMMA main loop. Reusing
+     the same shared tile for K during QK and then for V during PV reduced
+     dynamic shared memory from `45888 B` to `28480 B`.
+   - NCU confirmed the resource mechanism: shared-memory residency improved
+     from 2 to 3 CTAs/SM and achieved occupancy rose from `49.6%` to `74.1%`.
+     Full `large` latency improved from `2.5918 ms` to `2.2853 ms`.
+   - Why it works: this preserves the proven shared-memory WMMA operand layout
+     but removes unnecessary simultaneous residency. It is a resource/dataflow
+     change, not a K/V layout or direct-global operand change.
+
+17. **Spend freed shared-memory budget on one-round PV accumulator import** (`[pv-path]` `[shared-memory]` `[sync]` `[dataflow]`)
+   - After single operand tile reuse, widening the PV scratch pitch to `136`
+     still allowed 3 CTAs/SM and let both persistent PV accumulator phases be
+     stored and imported in one handoff round.
+   - NCU after the change showed dynamic shared memory `32832 B`, occupancy
+     `74.2%`, instructions `717.2M -> 708.0M`, and shared bank conflicts
+     `31.8M -> 30.9M`. Full `large` improved to `2.2566 ms` in the promotion
+     run.
+   - Why it works: once shared-memory residency has headroom, a wider scratch
+     can reduce synchronization and handoff rounds without lowering CTA
+     residency.
+
+18. **Remove hot-path intermediate materialization with a register-owned Tensor Core route** (`[register-dataflow]` `[tensor-core]` `[cta-geometry]` `[dataflow]`)
+   - Replacing the shared-materialized score/probability route with a register
+     fragment route improved the regtc full benchmark from `large=1.9261 ms` to
+     `large=1.3911 ms` and `xlarge=6.4678 ms` to `xlarge=4.9442 ms`.
+   - The winning configuration keeps score and probability fragments in
+     registers, uses Tensor Core for PV, uses `BLOCK_KV=16` to reduce live
+     fragment state, splits K and V shared operand tiles to remove an operand
+     reuse barrier, and uses `BLOCK_Q=128` to reduce grid/KV repetition.
+   - Why it works: the prior design's bottleneck was the dataflow boundary
+     itself, not the exact shared-memory layout. Removing the hot intermediate
+     reduces instruction and handoff cost enough to beat the occupancy loss from
+     higher register/shared-memory use.
+   - Execution rule: give this type of route a finite repair budget. In run_035,
+     an intermediate `BLOCK_KV=32` version exposed a shared-memory race and
+     failed determinism; fixing the synchronization revealed the route was
+     strongly positive.
+
 ### Anti-patterns
 
+- **Treating old-design partial bypass failures as proof against a full redesign** (`[strategy]` `[dataflow]` `[register-dataflow]`)
+  - Several earlier experiments removed only one shared store/read or grafted a
+    new primitive onto the old ownership model. They regressed because they
+    duplicated expensive work, carried the old intermediate, or increased
+    register pressure without deleting the dominant handoff.
+  - Reason: negative evidence must be scoped to the dataflow actually tested.
+    If the old intermediate remains, the result blocks that local graft, not a
+    route that removes the intermediate and rebalances ownership/tile shape
+    together.
+- **CUDA-only standard-WMMA role/dataflow rewrites after run_024** (`[cuda-only]` `[dataflow]` `[shared-memory]`)
+  - Key-segment partial PV output regressed to `large=6.1790 ms`; reusing
+    score/PV worker warps as owner rows regressed to `2.3796 ms`; generating
+    probabilities directly from QK fragments in worker warps regressed to
+    `3.6539 ms`.
+  - Reason: these variants attack the right shared-materialization bottleneck
+    but move too much row-stat/probability/PV work onto the score/PV worker
+    critical path or require large partial-output reductions. The current
+    standard-WMMA design depends on owner/worker overlap.
+- **Simple `cp.async` conversion for current full-prefix K/V staging** (`[cuda-only]` `[pipeline]` `[staging]`)
+  - Replacing hot full-prefix `uint4` staging loops with
+    `cp.async.ca.shared.global` regressed to `large=2.4965 ms`.
+  - Reason: the current staging bottleneck is not exposed global-memory latency
+    that a minimal async-copy conversion can hide. The added commit/wait
+    pipeline overhead is worse than the existing vectorized load/store path.
+- **Direct `64x64 / 4-warp` standard-WMMA CTA translation** (`[tile-size]` `[launch-config]` `[tensor-core]`)
+  - A runtime-general prototype passed correctness but regressed to
+    `large=4.7008 ms` versus the current best `2.2567 ms`.
+  - Reason: reducing grid count and K/V staging repetition is not sufficient
+    when the ownership model leaves only `2` lanes per row and requires eight
+    PV accumulator fragments per warp. Larger-M CTA work needs a different
+    low-level warp/MMA ownership model, not direct standard-WMMA expansion.
+- **Worker-side probability recompute to avoid `prob_tile` stores** (`[dataflow]` `[shared-memory]` `[instruction-count]`)
+  - Computing PV probability fragments from `score_tile + row_m` instead of
+    storing `prob_tile` passed correctness but regressed to `large=2.7766 ms`.
+  - Reason: the removed shared stores were outweighed by duplicate `exp2`
+    work and fused-PV register/code pressure. A probability bypass must reuse
+    already computed probabilities or keep score fragments live cheaply; simply
+    moving exponent work into worker warps is negative.
+- **Post-run_023 local variants around the run_022 dataflow** (`[dataflow]` `[staging]` `[pv-path]`)
+  - Scratch aliasing and approximate `ex2` were directionally positive but only
+    `+0.38%` and `+0.11%`, below threshold. Direct global V and K operands
+    regressed to `2.9001 ms` and `3.2990 ms`; forced
+    `__launch_bounds__(384,4)` regressed to `3.1151 ms`; first PV tile direct
+    assignment regressed to `2.8286 ms`; `__ldg` vector staging regressed to
+    `2.7870 ms`.
+  - Reason: after single operand tile reuse and one-round PV import, local
+    branch/cache/scheduling variants do not change the dominant dataflow. Future
+    work should reduce score/probability/PV materialization or change the
+    ownership/main-loop structure instead of polishing the same handoff.
+- **Post-run_022 single-tile staging micro-variants** (`[shared-memory]` `[staging]` `[sync]`)
+  - Removing the duplicate padding store after K/V tile aliasing improved only
+    `0.15%`, below threshold. Distributing V restaging across all CTA threads
+    regressed because worker-only restaging overlaps better with owner
+    probability generation. Removing the final import-readback barrier improved
+    `large` by only `0.08%` and was mixed on other sizes.
+  - Reason: after the structural single-tile and one-round import wins, the
+    nearby padding/restaging/barrier variants no longer remove enough dynamic
+    work to survive full-benchmark gating.
+- **Standard WMMA probability pitch padding for the PV A operand** (`[bank-conflict]` `[pv-path]` `[shared-memory]`)
+  - Padding the probability tile leading dimension from `64` to `72` while
+    still using standard `wmma::load_matrix_sync` regressed `large` from
+    `3.2487 ms` to `4.1242 ms`.
+  - Reason: although it targets the right source-attributed line, the standard
+    WMMA load/codegen/layout cost dominates any conflict reduction. Prefer the
+    manual probability fragment dataflow instead of nearby standard-WMMA pitch
+    sweeps.
 - **K/V pitch or generic shared-memory tuning for the current bank-conflict signal** (`[shared-memory]` `[bank-conflict]`)
   - Source attribution showed K/V full-prefix staging, residual staging, scalar `prob_tile` stores, and `v_tile` WMMA-B loads have actual shared wavefronts equal to ideal or zero excessive wavefronts.
   - Reason: the aggregate `~169.8M` bank-conflict signal is dominated by PV WMMA-A loads of `prob_tile` and WMMA accumulator stores. K/V layout work does not attack the source-attributed bottleneck.
@@ -517,12 +946,83 @@ Patterns below are indexed by **bottleneck type** rather than kernel. When the a
 - **Adjacent PV-WMMA micro-tweaks after scratch reuse** (`[pv-path]` `[shared-memory]` `[control-flow]`)
   - Compact `V` pitch, `kWmmaBlockN=128`, explicit phase-loop unroll, diagonal-adjacent PV-WMMA coverage, padded `65`-stride PV scratch, and lane-half phase checks all failed to beat the scratch-reuse PV-WMMA best.
   - Reason: after the structural PV-WMMA change, the nearby local layout/control variants were either below the full-benchmark keep threshold or added resource/control cost. Future work should change the dataflow boundary again instead of sweeping neighboring forms of the same implementation.
+- **Post-run_015 score pitch and manual accumulator-store variants** (`[bank-conflict]` `[score-tile]` `[pv-path]`)
+  - QK score tile pitch `68` improved the primary `large` metric by only
+    `0.68%`, below the keep threshold. Manual PV accumulator scratch stores
+    improved `large` by only `0.07%` and regressed `medium`/`xlarge`.
+  - Reason: after the manual probability fragment and PV scratch-pitch changes,
+    the remaining local store/readback conflict is too small for another
+    isolated layout/store tweak to reliably move full-benchmark performance.
+    Require new source-line evidence before revisiting this neighborhood.
+- **Post-run_017 local handoff/sync/worker tweaks** (`[pv-path]` `[sync]` `[worker-warps]`)
+  - Merging score/PV worker warps regressed to `large=3.1731 ms`; limiting
+    staging work to `256` CTA threads regressed to `large=4.3249 ms`;
+    fallback-only control sinking improved only `0.09%`; skipping one
+    loop-ending barrier regressed to `large=2.8871 ms`; PV scratch `float2`
+    readback improved only `0.49%`.
+  - Reason: these are local variants around the same shared-handoff dataflow.
+    The current plateau requires reducing CTA/warp count and the
+    score/probability/PV handoff together, not shaving isolated instructions
+    from a design whose total instruction count is still far above reference.
+- **Over-compressing owner rows below 16 lanes per row** (`[owner-warps]` `[cta-geometry]`)
+  - Reducing from the kept `8` owner warps to `4` owner warps, with four
+    8-lane row groups per owner warp, regressed to `large=3.0249 ms`.
+  - Re-testing after run_020 persistent PV accumulation still regressed to
+    `large=2.9888 ms` in quick benchmark.
+  - Reason: the CTA thread count drops, but each row has too little parallelism.
+    Per-lane softmax/readback work and reduced staging participation dominate.
+    For this dataflow, 16 lanes per query row is the useful compression point.
+- **Naive 32-query-row CTA phase reuse** (`[cta-geometry]` `[staging-reuse]`)
+  - Processing two 16-row query phases per staged K/V tile regressed to
+    `large=3.7870 ms`.
+  - Reason: K/V staging reuse was overwhelmed by doubled owner state,
+    serialized query phases, a larger Q shared tile, and extra synchronization.
+    Larger query coverage needs a different ownership/dataflow model, not
+    serial reuse of the current owner-warp path.
+- **Separate score and PV scratch slabs after scratch reuse** (`[shared-memory]` `[dataflow]`)
+  - Giving QK score storage and PV accumulator scratch separate shared regions
+    regressed to `large=2.9032 ms`.
+  - Reason: score/PV scratch aliasing is not the remaining bottleneck; extra
+    shared footprint and address-shape cost outweigh any isolation benefit.
 - **PV-owned accumulation via a larger shared accumulator** (`[pv-path]` `[shared-memory]` `[dataflow]`)
   - A runtime-general full-prefix shared-accumulator probe passed quick correctness but regressed `large` to `5.0465 ms`.
   - Reason: moving ownership out of owner warps only helps if the accumulator stays low-overhead. Adding a `16x128` shared accumulator increases shared footprint and shared update traffic enough to overwhelm the saved owner readback. Register-level PV ownership would need a different dataflow because standard WMMA fragment layout is not suitable for row-wise online-softmax scaling.
 - **Probability-subtile streaming with standard WMMA fragments** (`[score-prob]` `[pv-path]` `[tensor-core]`)
   - A runtime-general `16x16` probability subtile version passed quick correctness but regressed `large` to `5.4388 ms`.
   - Reason: the standard WMMA implementation requires extra full-block barriers between probability-subtile production and PV consumption, and the two-accumulator-fragment PV path increases register/code pressure. The saved `16x64` probability materialization is not enough to offset those costs.
+- **Keeping standard WMMA QK accumulator fragments live across row-stat barriers** (`[score-tile]` `[dataflow]` `[tensor-core]`)
+  - A run_020 attempt to bypass full-prefix score materialization by preserving
+    QK accumulator fragments across multiple CTA-wide barriers exceeded a
+    reasonable compile window and was reverted.
+  - Reason: in the current monolithic standard-WMMA kernel, this creates too
+    much compile/register-allocation pressure. A future score/probability
+    bypass should be a smaller lower-level MMA pipeline or separate main-loop
+    redesign, not this direct fragment-lifetime extension.
+- **BF16 score scatter into probability storage** (`[score-tile]` `[data-type]` `[shared-memory]`)
+  - Storing full-prefix QK scores as BF16 in `prob_tile` and overwriting them
+    with probabilities passed quick correctness but regressed to
+    `large=2.7729 ms`.
+  - Reason: manual fragment scatter and BF16 conversion cost exceeded the saved
+    shared-memory footprint.
+- **Fusing the two full-prefix PV value phases in standard WMMA** (`[pv-path]` `[dataflow]` `[register-pressure]`)
+  - Constructing `p_frag` once per `k_step` and feeding both value-column halves
+    passed quick correctness but regressed to `large=2.7117 ms`.
+  - Reason: simultaneous phase fragments increase register/code pressure more
+    than the saved probability-fragment loads help.
+- **Post-run_021 local PV/probability load/store formatting** (`[pv-path]` `[probability-store]` `[shared-memory]`)
+  - Vectorized manual probability-fragment loads improved only `0.41%`; hoisting
+    repeated `row_alpha_tile` loads improved only `0.47%`; vectorized bf16x2
+    probability stores regressed `large` by about `8%`.
+  - Reason: after persistent PV accumulation and owner score caching, these
+    local shared-memory formatting changes do not remove enough dynamic work.
+    The probability-store version also introduces shuffle/branch imbalance that
+    overwhelms the reduced store count.
+- **Score pitch variants after owner score caching** (`[score-tile]` `[scratch-layout]`)
+  - Re-testing score tile pitch `68` after run_021's owner score cache tied the
+    primary metric and regressed `xlarge`.
+  - Reason: score pitch remains below the keep threshold even after the owner
+    read pattern changed. Do not continue score-pitch variants without new
+    source-level evidence that score-store conflicts have become dominant.
 - **Boundary-only score/owner tweaks after `run_009`** (`[causal-mask]` `[score-tile]` `[wmma-hotloop]`)
   - Tail tiles, diagonal-tile cleanups, partial score-warp gating, and similar
     boundary-only changes affect too little of the `seq_len=2048` primary
