@@ -17,6 +17,8 @@ def choose_best_iteration(iterations: list[dict[str, Any]]) -> dict[str, Any] | 
             continue
         if not item.get("full_report_exists", False):
             continue
+        if kernel.get("stable") is False:
+            continue
         median = kernel.get("median_ms")
         avg = kernel.get("average_ms")
         try:
@@ -39,6 +41,7 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
     strategy = record.get("strategy") or {}
     constraints = strategy.get("constraints") or {}
     guidance = record.get("guidance") or {}
+    route = record.get("architecture_route") or {}
     kernel_traits = guidance.get("kernel_traits") or {}
     lines = [
         f"# Iteration v{record.get('iteration')}",
@@ -59,6 +62,20 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
         f"- reason: {strategy.get('reason') or 'not_available'}",
         f"- blocked fingerprints: {', '.join(constraints.get('blocked') or []) or 'none'}",
         f"- preferred fingerprints: {', '.join(constraints.get('preferred') or []) or 'none'}",
+        f"- active routes: {', '.join(constraints.get('active_routes') or []) or 'none'}",
+        f"- design boundary active: {', '.join(constraints.get('design_boundary_active') or []) or 'no'}",
+        f"- design boundary reason: {', '.join(constraints.get('design_boundary_reason') or []) or 'none'}",
+        "",
+        "## Architecture Route",
+        f"- enabled: {route.get('enabled', False)}",
+        f"- route id: {route.get('route_id') or 'none'}",
+        f"- invariant: {route.get('invariant') or 'none'}",
+        f"- expected impact: {route.get('expected_impact') or 'none'}",
+        f"- budget: {route.get('budget') or 0}",
+        f"- iteration role: {route.get('iteration_role') or 'none'}",
+        f"- allow regression: {route.get('allow_regression', False)}",
+        f"- stop condition: {route.get('stop_condition') or 'none'}",
+        f"- route plan: {route.get('route_plan') or 'none'}",
         "",
         "## Guidance",
         f"- guidance class: {guidance.get('guidance_class', 'none')}",
@@ -78,6 +95,8 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
         "",
         "## Commands",
         f"- benchmark: `{record.get('benchmark_command', '')}`",
+        f"- quick validation reason: {record.get('quick_validation_reason') or 'none'}",
+        f"- quick benchmark json: {record.get('quick_benchmark_json') or 'none'}",
         f"- targeted ncu: `{record.get('targeted_ncu_command', '')}`",
         f"- full ncu: `{record.get('full_ncu_command', '')}`",
         "",
@@ -86,6 +105,10 @@ def render_iteration_markdown(record: dict[str, Any]) -> str:
         f"- kernel median ms: {kernel.get('median_ms')}",
         f"- kernel min ms: {kernel.get('min_ms')}",
         f"- kernel max ms: {kernel.get('max_ms')}",
+        f"- kernel spread pct: {kernel.get('spread_pct')}",
+        f"- kernel cv pct: {kernel.get('cv_pct')}",
+        f"- kernel timing stable: {kernel.get('stable')}",
+        f"- kernel trials ms: {kernel.get('trials_ms')}",
         f"- speedup vs pytorch: {bench.get('speedup_vs_pytorch')}",
         f"- reference average ms: {reference.get('average_ms')}",
         "",
@@ -119,11 +142,14 @@ def render_final_summary(manifest: dict[str, Any]) -> str:
         f"- positive: {len((strategy_scope.get('positive') or {}).keys())}",
         f"- negative: {len((strategy_scope.get('negative') or {}).keys())}",
         f"- rejected: {len((strategy_scope.get('rejected') or {}).keys())}",
+        f"- inconclusive: {len((strategy_scope.get('inconclusive') or {}).keys())}",
+        f"- routes: {len((strategy_scope.get('routes') or {}).keys())}",
+        f"- design boundary active: {(strategy_scope.get('design_boundary') or {}).get('active', False)}",
         "",
         "## Iterations",
         "",
-        "| Iter | Outcome | Correctness | Kernel median ms | Guidance | Full NCU | Snapshot |",
-        "| --- | --- | --- | ---: | --- | --- | --- |",
+        "| Iter | Outcome | Route | Correctness | Kernel median ms | Guidance | Full NCU | Snapshot |",
+        "| --- | --- | --- | --- | ---: | --- | --- | --- |",
     ]
     for item in manifest.get("iterations", []):
         bench = item.get("benchmark_result") or {}
@@ -131,8 +157,10 @@ def render_final_summary(manifest: dict[str, Any]) -> str:
         kernel = bench.get("kernel") or {}
         strategy = item.get("strategy") or {}
         guidance = item.get("guidance") or {}
+        route = item.get("architecture_route") or {}
+        route_cell = route.get("route_id") if route.get("enabled") else "-"
         lines.append(
-            f"| v{item.get('iteration')} | {strategy.get('outcome', 'pending')} | {correctness.get('passed')} | {kernel.get('median_ms', '-')} | {guidance.get('tensor_core_recommendation', '-')} | {'yes' if item.get('full_report_exists') else 'no'} | {item.get('snapshot_file', '-')} |"
+            f"| v{item.get('iteration')} | {strategy.get('outcome', 'pending')} | {route_cell} | {correctness.get('passed')} | {kernel.get('median_ms', '-')} | {guidance.get('tensor_core_recommendation', '-')} | {'yes' if item.get('full_report_exists') else 'no'} | {item.get('snapshot_file', '-')} |"
         )
     best = manifest.get("best_iteration")
     lines.extend(["", "## Best"])

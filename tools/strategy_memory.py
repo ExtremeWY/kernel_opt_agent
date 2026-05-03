@@ -68,7 +68,7 @@ def build_strategy_fingerprint(kernel_type: str, tags: list[str]) -> str:
 
 def default_global_strategy_memory() -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "updated_at": "",
         "scopes": {},
     }
@@ -78,7 +78,7 @@ def load_global_strategy_memory(path: Path) -> dict[str, Any]:
     if not path.exists():
         return default_global_strategy_memory()
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload.setdefault("version", 1)
+    payload.setdefault("version", 2)
     payload.setdefault("updated_at", "")
     payload.setdefault("scopes", {})
     return payload
@@ -99,6 +99,14 @@ def ensure_scope(global_payload: dict[str, Any], scope_key: str, meta: dict[str,
             "positive": {},
             "negative": {},
             "rejected": {},
+            "inconclusive": {},
+            "routes": {},
+            "design_boundary": {
+                "active": False,
+                "reason": "",
+                "marked_at": "",
+                "cleared_at": "",
+            },
             "guidance_history": [],
         }
         scopes[scope_key] = scope
@@ -107,6 +115,17 @@ def ensure_scope(global_payload: dict[str, Any], scope_key: str, meta: dict[str,
         scope.setdefault("positive", {})
         scope.setdefault("negative", {})
         scope.setdefault("rejected", {})
+        scope.setdefault("inconclusive", {})
+        scope.setdefault("routes", {})
+        scope.setdefault(
+            "design_boundary",
+            {
+                "active": False,
+                "reason": "",
+                "marked_at": "",
+                "cleared_at": "",
+            },
+        )
         scope.setdefault("guidance_history", [])
     return scope
 
@@ -125,30 +144,136 @@ def get_kernel_median_ms(record: dict[str, Any]) -> float | None:
 
 def classify_strategy_outcome(record: dict[str, Any], previous_record: dict[str, Any] | None) -> tuple[str, str]:
     bench = record.get("benchmark_result") or {}
+    route = record.get("architecture_route") or {}
+    route_mode = bool(route.get("enabled"))
+    route_role = str(route.get("iteration_role") or "")
+    route_validation = route_mode and route_role == "validation"
+
+    def nonblocking_route(reason: str) -> tuple[str, str]:
+        if route_mode and not route_validation:
+            return ("inconclusive", f"architecture_route_subiteration:{reason}")
+        return ("rejected", reason)
+
     if record.get("benchmark_rc") != 0:
         error = bench.get("error") or {}
         code = str(error.get("code") or "").strip()
-        return ("rejected", f"benchmark_failed:{code or 'unknown'}")
+        return nonblocking_route(f"benchmark_failed:{code or 'unknown'}")
     if bench.get("correctness", {}).get("passed") is False:
-        return ("rejected", "correctness_failed")
+        return nonblocking_route("correctness_failed")
     if record.get("targeted_ncu_rc") not in (None, 0):
-        return ("rejected", "targeted_ncu_failed")
+        return nonblocking_route("targeted_ncu_failed")
     if record.get("full_ncu_rc") not in (None, 0):
-        return ("rejected", "full_ncu_failed")
+        return nonblocking_route("full_ncu_failed")
     if record.get("ncu_expected") and not record.get("full_report_exists"):
-        return ("rejected", "ncu_incomplete")
+        return nonblocking_route("ncu_incomplete")
+    if (bench.get("kernel") or {}).get("stable") is False:
+        return nonblocking_route("timing_unstable")
 
     current_median = get_kernel_median_ms(record)
     if previous_record is None:
         return ("positive", "baseline_seed")
     if current_median is None:
-        return ("rejected", "no_current_median")
+        return nonblocking_route("no_current_median")
     previous_median = get_kernel_median_ms(previous_record)
     if previous_median is None:
-        return ("rejected", "no_previous_median")
+        return nonblocking_route("no_previous_median")
     if current_median < previous_median:
         return ("positive", "faster_than_previous")
+    if route_mode and not route_validation:
+        return ("inconclusive", "architecture_route_subiteration:slower_or_equal_to_previous")
     return ("negative", "slower_or_equal_to_previous")
+
+
+def build_route_id(kernel_type: str, invariant: str) -> str:
+    route_text = invariant.strip() or "unspecified_route_invariant"
+    return f"{sanitize_token(kernel_type)}_{fingerprint_from_text(route_text)}"
+
+
+def update_route_state(
+    scope: dict[str, Any],
+    route_id: str,
+    route_metadata: dict[str, Any],
+    record: dict[str, Any],
+) -> None:
+    routes = scope.setdefault("routes", {})
+    route = routes.get(route_id)
+    if route is None:
+        route = {
+            "route_id": route_id,
+            "invariant": route_metadata.get("invariant", ""),
+            "expected_impact": route_metadata.get("expected_impact", ""),
+            "budget": route_metadata.get("budget", 0),
+            "stop_condition": route_metadata.get("stop_condition", ""),
+            "route_plan": route_metadata.get("route_plan", ""),
+            "status": "active",
+            "created_at": now_iso(),
+            "updated_at": "",
+            "subiterations": [],
+        }
+        routes[route_id] = route
+
+    route["updated_at"] = now_iso()
+    if route_metadata.get("invariant"):
+        route["invariant"] = route_metadata["invariant"]
+    if route_metadata.get("expected_impact"):
+        route["expected_impact"] = route_metadata["expected_impact"]
+    if route_metadata.get("budget"):
+        route["budget"] = route_metadata["budget"]
+    if route_metadata.get("stop_condition"):
+        route["stop_condition"] = route_metadata["stop_condition"]
+    if route_metadata.get("route_plan"):
+        route["route_plan"] = route_metadata["route_plan"]
+
+    strategy = record.get("strategy") or {}
+    entry = {
+        "iteration": record.get("iteration"),
+        "experiment_id": record.get("experiment_id", ""),
+        "role": route_metadata.get("iteration_role", ""),
+        "git_sha": record.get("git_sha", ""),
+        "kept": bool(record.get("kept")),
+        "decision_reason": record.get("decision_reason", ""),
+        "strategy_outcome": strategy.get("outcome", ""),
+        "strategy_reason": strategy.get("reason", ""),
+        "benchmark_json": record.get("benchmark_json", ""),
+        "targeted_report": record.get("targeted_report", ""),
+        "full_report": record.get("full_report", ""),
+    }
+    route.setdefault("subiterations", []).append(entry)
+    used_budget = len(route.get("subiterations") or [])
+    route["used_budget"] = used_budget
+
+    outcome = strategy.get("outcome", "")
+    reason = strategy.get("reason", "")
+    if outcome == "positive" and record.get("kept"):
+        route["status"] = "active_positive"
+    elif route_metadata.get("iteration_role") == "validation" and outcome == "negative":
+        route["status"] = "negative"
+    elif route_metadata.get("iteration_role") == "validation" and outcome == "positive":
+        route["status"] = "validated_positive"
+    elif outcome == "inconclusive":
+        route["status"] = "active_repair" if used_budget < int(route.get("budget") or 0) else "budget_exhausted"
+    elif "correctness_failed" in reason or "benchmark_failed" in reason:
+        route["status"] = "active_repair"
+
+
+def update_design_boundary_state(scope: dict[str, Any], *, active: bool, reason: str) -> None:
+    state = scope.setdefault(
+        "design_boundary",
+        {
+            "active": False,
+            "reason": "",
+            "marked_at": "",
+            "cleared_at": "",
+        },
+    )
+    state["active"] = bool(active)
+    if active:
+        state["reason"] = reason.strip()
+        state["marked_at"] = now_iso()
+    else:
+        state["cleared_at"] = now_iso()
+        if reason.strip():
+            state["clear_reason"] = reason.strip()
 
 
 def update_memory_bucket(
@@ -194,7 +319,15 @@ def merge_strategy_constraints(scope: dict[str, Any]) -> dict[str, list[str]]:
     blocked = set((scope.get("rejected") or {}).keys())
     preferred = set((scope.get("positive") or {}).keys())
     preferred.difference_update(blocked)
+    active_routes = []
+    for route_id, route in (scope.get("routes") or {}).items():
+        status = str(route.get("status") or "")
+        if status.startswith("active") or status == "budget_exhausted":
+            active_routes.append(route_id)
     return {
         "blocked": sorted(blocked),
         "preferred": sorted(preferred),
+        "active_routes": sorted(active_routes),
+        "design_boundary_active": ["yes"] if (scope.get("design_boundary") or {}).get("active") else [],
+        "design_boundary_reason": [str((scope.get("design_boundary") or {}).get("reason") or "")],
     }

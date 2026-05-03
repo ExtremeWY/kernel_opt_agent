@@ -60,7 +60,11 @@ To add a new kernel, create `kernel_configs/<name>.toml` (sizes, dtypes, toleran
    cp kernels/<your_kernel>.cu kernel.cu    # if it exists
    ```
 5. Read the per-kernel log in `memory/<kernel_type>.md` if it exists, to review past experiments for this specific kernel.
-6. Read the relevant optimization references in `docs/`, especially `docs/triton_optimization.md`, `docs/cutlass_optimization.md`, `docs/sync_optimization.md`, `docs/compute_optimization.md`, `docs/memory_optimization.md`, and `docs/stall_reasons.md`.
+6. Read the relevant optimization references in `docs/`, especially
+   `docs/prototype_ladder.md`, `docs/triton_optimization.md`,
+   `docs/cutlass_optimization.md`, `docs/sync_optimization.md`,
+   `docs/compute_optimization.md`, `docs/memory_optimization.md`, and
+   `docs/stall_reasons.md`.
 7. Read `docs/strategy_memory.md` and respect the `blocked` / `preferred` fingerprints already recorded in `workspace/strategy_memory/global_strategy_memory.json`.
 8. Read `kernel.py` to understand the current kernel implementation.
 9. Read the relevant module(s) in `references/` (per-kernel reference implementations) to understand the correctness specification.
@@ -83,10 +87,12 @@ For quick iteration (skip numerical stability, determinism, edge cases):
 .venv/bin/python tools/bench.py --quick --json-out workspace/last_bench.json > run.log 2>&1
 ```
 
+Quick mode is directional evidence only. It benchmarks fewer cases but still emits multi-trial timing stability fields. If timing is unstable, or if the measured improvement/regression is close to the benchmark noise band, run the full benchmark before making a keep/revert decision.
+
 Read `run.log` and extract the key metrics:
 
 ```bash
-grep "correctness\|throughput_tflops\|speedup_vs_pytorch\|pct_peak_compute\|pct_peak_bandwidth\|bottleneck\|peak_vram_mb" run.log
+grep "correctness\|throughput_tflops\|speedup_vs_pytorch\|pct_peak_compute\|pct_peak_bandwidth\|bottleneck\|kernel_timing_spread_pct\|kernel_timing_stable\|peak_vram_mb" run.log
 ```
 
 The benchmark reports:
@@ -97,6 +103,7 @@ The benchmark reports:
 - **pct_peak_bandwidth**: % of GPU's theoretical bandwidth peak
 - **bottleneck**: `compute_bound` or `memory_bound` (from roofline analysis)
 - **speedup_vs_pytorch**: Speedup vs PyTorch reference implementation
+- **kernel_timing_spread_pct / kernel_timing_stable**: Multi-trial timing noise guard. Treat unstable results as inconclusive, not as optimization evidence.
 
 ### Step 2: Macro Performance Analysis
 
@@ -108,6 +115,52 @@ Analyze the benchmark results to understand the kernel's **macro-level** perform
 4. **Roofline position**: Where does the kernel sit on the roofline? How far from the ridge point?
 
 This gives you the **direction** of optimization (memory vs. compute), but not the **specific** cause.
+
+### Step 2b: Performance Model When No Strong Reference Exists
+
+A fast black-box reference profile is optional, not a requirement. If there is
+no trusted high-performance implementation to compare against, build a
+first-principles performance model before choosing experiments:
+
+1. **Operator contract**: record which dimensions, dtypes, layouts, and semantic
+   flags are true API or production invariants, and which are runtime-variable.
+2. **Minimum work**: estimate required FLOPs, required bytes, reductions,
+   synchronization points, and main-loop trip counts for each supported shape
+   regime.
+3. **Primitive ceilings**: estimate feasible upper bounds from hardware peak,
+   local microbenchmarks, or small isolated prototypes for copy bandwidth,
+   shared-memory staging, reductions, and MMA or scalar compute primitives.
+4. **Stage budget**: split the kernel into load/stage, core compute,
+   reduction/normalization, and store/epilogue stages. Estimate the dynamic work
+   fraction and best-case speedup if each stage became free.
+5. **Route candidates**: generate at least two structurally different route
+   invariants when the current kernel is far below the modeled ceiling. Do not
+   start with local pitch, padding, cache, branch, or launch-hint tweaks unless
+   the model shows those sites dominate end-to-end time.
+6. **Prototype ladder**: classify the current implementation by the ladder in
+   `docs/prototype_ladder.md`: parallel ownership, data locality, hot-state
+   residency, hardware primitive, layout, pipeline, grid scheduling, then local
+   cleanup. If a higher-upside earlier stage is missing, test that architecture
+   route before spending iterations on later-stage micro-tuning.
+
+The model is allowed to be approximate, but it must be explicit enough to reject
+low-coverage ideas before implementation.
+
+When the model indicates a design-boundary bottleneck, mark that state in
+strategy memory before running more experiments:
+
+```bash
+.venv/bin/python tools/run_loop.py \
+  --hypothesis "mark design-boundary limited state" \
+  --mark-design-boundary \
+  --design-boundary-reason "mainloop instruction/sync cost exceeds modeled ceiling" \
+  --state-only
+```
+
+Once marked, `tools/run_loop.py` rejects normal local experiments by default.
+Use `--architecture-route` with a route plan, or explicitly pass
+`--allow-local-after-boundary` only when the proposal explains why a local
+experiment is still justified.
 
 ### Step 3: NCU Deep Analysis
 
@@ -163,6 +216,12 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 9. **Generality gate**: reject benchmark-shape overfitting before editing code. A proposed optimization must be valid for the operator's intended runtime variability, not just for the current `kernel_configs/` sizes. Do not specialize on runtime-varying dimensions, batch counts, grid sizes, or other benchmark constants unless they are explicitly part of the operator contract or production invariant. Prefer optimizations based on stable facts such as dtype, hardware architecture, fixed layout contracts, fixed semantic dimensions, or runtime tile-state checks that work for arbitrary supported problem sizes.
 10. **History-neighborhood gate**: if a proposed change is an adjacent variant of a negative or rejected strategy (same hot path, same data layout family, same tile sweep, same load/store trick), skip it unless there is new contradictory NCU evidence showing that the bottleneck moved.
 11. **Priority gate**: rank all candidate hypotheses by expected end-to-end impact divided by implementation/validation risk. Spend early iterations on the dominant bottleneck only; leave cleanup and noise-floor micro-tuning for after a structural improvement is working.
+12. **Design-boundary gate**: if a fast reference profile, self-profile trend, source attribution, or the Step 2b performance model shows a large gap in total instructions, LSU/shared-memory handoff, synchronization, main-loop trip count, or launched work while unavoidable DRAM traffic is already near the minimum, classify the current implementation as design-boundary limited. In that state, do not keep spending iterations on local layout, padding, cache hints, branch cleanup, or small launch-shape variants. The next proposals must remove or replace the dominant dataflow boundary.
+13. **Negative-evidence scope gate**: do not over-generalize a failed experiment. A negative result only blocks the dataflow and implementation scope that was actually tested. If a failed change still kept the dominant old intermediate, duplicated expensive work, or grafted a new primitive onto the old ownership model, it does not disprove a full redesign that removes the old boundary.
+14. **Architecture-route budget gate**: when a high-upside design-boundary route is selected, define a route-level invariant and budget before editing. The route may take multiple sub-iterations to become correct and fast. Correctness failures, races, register pressure, or first-version regressions should trigger focused fixes inside the same route until the route budget is exhausted, not immediate abandonment of the route. The budget must still be finite and evidence-driven.
+15. **No-reference route gate**: when there is no high-performance reference, route selection must be justified by the performance model and current-kernel NCU/source attribution. The proposal must name the structural cost to remove, the affected dynamic-work fraction, the primitive ceiling being targeted, and why the route is not a benchmark-shape specialization.
+16. **Prototype-ladder gate**: before proposing local cleanup, record the current prototype-ladder stage and the next missing high-upside stage from `docs/prototype_ladder.md`. If the next missing stage targets the dominant steady-state work and has plausible multi-percent payoff, it must become an architecture route instead of a local experiment.
+17. **Stage-promotion gate**: a route can only be considered rejected after a correctness-passing, resource-balanced implementation actually satisfies its route invariant. Failed partial grafts, implementations that still carry the old hot intermediate, or first versions with repairable synchronization/resource issues are narrow negative evidence or route sub-iterations, not proof that the broader stage is invalid.
 
 **Rules:**
 - One change per experiment. Do not combine unrelated optimizations.
@@ -174,6 +233,17 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 - For boundary-only changes (tail cases, partial tiles, uncommon predicates, rare dtype/shape paths), compute what fraction of the benchmarked dynamic work they cover. If that fraction is small, deprioritize them behind changes that affect the steady-state hot path.
 - Runtime checks for common tile states are allowed when they preserve correctness and performance portability across all supported sizes. Benchmark-only dispatch is not allowed.
 - Do not turn a structural bottleneck into a series of local layout/load/barrier tweaks. If NCU and history indicate the design itself is wrong, the next experiments must change the design boundary.
+- When pursuing a design-boundary route, keep the route invariant explicit. Examples of route invariants include “remove a materialized intermediate from the hot path,” “change the ownership model so the producer consumes its own result,” or “move the dominant work to the intended hardware pipeline.” Sub-iterations may tune tile shape, resource balance, or synchronization only if they preserve that invariant.
+- Do not classify an architecture route as failed because one intermediate implementation regressed while it still carried the old bottleneck. Record whether the tested version truly removed the dominant intermediate or only partially bypassed it.
+- If a local family has produced several sub-threshold wins while the reference gap remains large, stop the family even if each individual change is plausible. A chain of small wins can still lead to a hard design ceiling.
+- Do not keep optimizing a low-ceiling prototype just because it is the nearest
+  editable code. If the operator model points to a different ownership,
+  residency, primitive, or pipeline stage with much larger expected payoff,
+  switch to an architecture route and budget multiple repair iterations.
+- If there is no strong reference gap to quote, replace “reference gap” with
+  “gap to modeled primitive or stage ceiling.” Lack of a reference is not a
+  reason to continue local micro-tuning after the model and NCU identify a
+  structural boundary.
 - Never satisfy an optimization task by swapping in a library implementation. Improve the custom kernel code itself.
 
 ### Step 5: Modify
@@ -205,8 +275,43 @@ git commit -m "experiment: <brief description of change>"
 | Condition | Action |
 |-----------|--------|
 | correctness = FAIL | **REVERT** immediately: `git reset --hard HEAD~1` (reverts both `kernel.py` and `kernel.cu`) |
-| correctness = PASS, throughput improved (>1%) | **KEEP** |
-| correctness = PASS, throughput same or worse | **REVERT**: `git reset --hard HEAD~1` |
+| correctness = PASS, timing unstable | **RUN FULL/STABLE BENCHMARK** before deciding; do not keep/revert from an unstable quick result |
+| correctness = PASS, full/stable benchmark throughput improved (>1%) | **KEEP** |
+| correctness = PASS, full/stable benchmark throughput same or worse | **REVERT**: `git reset --hard HEAD~1` |
+
+If `--quick` and full benchmark disagree, use the full benchmark result. If the delta is within the configured timing stability threshold, treat the experiment as inconclusive and prefer another hypothesis instead of tuning around noise.
+
+Architecture-route exception:
+
+- A structural route must still revert broken code unless explicitly kept as a
+  correctness-passing prototype, but a failed or slower non-validation
+  sub-iteration is recorded as `inconclusive`, not as a route-blocking negative.
+  `tools/run_loop.py` exits successfully for such non-validation route
+  sub-iterations so a route executor can continue until the route budget or stop
+  condition is reached.
+- Use route mode for multi-sub-iteration structural work:
+  ```bash
+  .venv/bin/python tools/run_loop.py \
+    --hypothesis "prototype new ownership route" \
+    --architecture-route \
+    --route-invariant "remove the dominant dataflow boundary" \
+    --route-expected-impact "affects steady-state mainloop; target >5% end-to-end" \
+    --route-budget 8 \
+    --route-stop-condition "validated implementation below threshold or budget exhausted" \
+    --route-plan workspace/runs/run_xxx/architecture_route_plan.md \
+    --route-iteration-role prototype \
+    --quick
+  ```
+- When design-boundary mode is active and the route id is new, the route plan is
+  mandatory. It must contain at least two structurally distinct route candidates
+  and must not contain placeholder fields such as `fill_me`, `todo`, or `tbd`.
+  It must also record the current prototype-ladder stage, the next missing
+  high-upside stage, route promotion criteria, and the scope of negative
+  evidence.
+- Use `--route-allow-regression` only when a correctness-passing prototype must
+  remain in the worktree for follow-up sub-iterations. Do not use it for final
+  validation. The route must eventually pass normal full/stable keep criteria in
+  a `--route-iteration-role validation` run.
 
 ### Step 9: Record
 
@@ -223,6 +328,10 @@ The extended columns capture micro-architectural context for lineage tracking:
 - `ncu_top_stall`, `ncu_occupancy`, `ncu_l1_hit_rate`, `ncu_l2_hit_rate`: from `tools/ncu_profile.py` output
 - `strategy_tags`, `strategy_fingerprint`, `strategy_outcome`, `strategy_reason`: from `optimization_proposal.md` + `workspace/strategy_memory/global_strategy_memory.json`
 - `run_dir`, `iter_dir`, `targeted_ncu_report`, `full_ncu_report`: artifact lineage
+- architecture-route metadata is stored in each run manifest and in
+  `workspace/strategy_memory/global_strategy_memory.json` under `routes`.
+  Non-validation route failures are `inconclusive` so they do not poison the
+  blocked fingerprint set.
 
 **9b. Archive per-iteration artifacts under `workspace/runs/run_xxx/iter_vN/`:**
 
@@ -330,10 +439,12 @@ cuda-evolve/
 ├── CUDA_OPTIMIZATION.md        # Agent-maintained: optimization patterns by kernel type + cross-kernel patterns
 ├── memory/
 │   └── <kernel_type>.md        # Detailed experiment log per kernel
-└── docs/                       # Reference documentation (READ-ONLY)
+└── docs/                       # Reference documentation (read during kernel optimization)
     ├── stall_reasons.md        # NCU warp stall type reference
     ├── memory_optimization.md  # Memory subsystem optimization guide
     ├── compute_optimization.md # Compute optimization guide
+    ├── prototype_ladder.md     # Structural route ladder and promotion gates
+    ├── architecture_route_plan_template.md # Structural route plan template
     └── arch_notes.md           # GPU architecture specifications
 ```
 
@@ -345,7 +456,7 @@ cuda-evolve/
 - **`CUDA_OPTIMIZATION.md`**: Grows over time as the agent discovers what works. Organized by kernel type with tagged entries (e.g., `[register-pressure]`, `[occupancy]`). Includes a "Cross-Kernel Optimization Patterns" section for transferable techniques.
 - **`memory/<kernel_type>.md`**: Detailed per-kernel experiment log with full NCU analysis, hypotheses, and outcomes. This is the primary record for each kernel.
 - **`workspace/MEMORY.md`**: High-level cross-kernel summary. Kept concise — just the current best results and transferable insights.
-- **`docs/`**: Curated reference documentation on GPU optimization. **Never modify.** Read the relevant files directly when investigating a specific bottleneck.
+- **`docs/`**: Curated reference documentation on GPU optimization. During kernel optimization, treat these files as read-only. Framework-maintenance tasks may update them, but must keep the changes general and documented.
 - **`workspace/results.tsv`**: Extended schema with NCU micro-metrics, git SHA, parent experiment lineage, and bottleneck classification.
 - **`workspace/ncu_reports/`**: Directory for NCU profiling exports and related artifacts.
 
@@ -441,20 +552,31 @@ For faster iteration, use `tools/run_loop.py` to automate Steps 6-9 (commit, ben
 .venv/bin/python tools/run_loop.py --hypothesis "increase tile size from 64 to 128"
 
 # With NCU profiling:
-.venv/bin/python tools/run_loop.py --hypothesis "vectorize loads" --ncu
+.venv/bin/python tools/run_loop.py --hypothesis "vectorize loads" --targeted-ncu
 
 # Quick mode (skip correctness stages 3-5):
 .venv/bin/python tools/run_loop.py --hypothesis "try num_warps=8" --quick
 
 # Dry run (show what would happen):
 .venv/bin/python tools/run_loop.py --hypothesis "test change" --dry-run
+
+# Structural route mode:
+.venv/bin/python tools/run_loop.py \
+  --hypothesis "prototype new mainloop ownership" \
+  --architecture-route \
+  --route-invariant "remove the dominant steady-state handoff" \
+  --route-expected-impact "mainloop coverage high; target >5% end-to-end" \
+  --route-budget 8 \
+  --route-iteration-role prototype \
+  --targeted-ncu
 ```
 
 The runner automatically:
 - Commits `kernel.py` (and `kernel.cu` if present) before benchmarking
 - Runs `tools/bench.py` and parses metrics
 - Optionally runs `tools/ncu_profile.py`
-- Applies keep/revert decision (>1% improvement threshold)
+- Applies keep/revert decision (>1% improvement threshold for normal
+  experiments; route-aware inconclusive handling for architecture routes)
 - Appends full metadata to `workspace/results.tsv` (including git_sha, NCU metrics)
 - Outputs a compact summary
 
@@ -463,7 +585,7 @@ This reduces token usage and eliminates the risk of forgetting to commit or reve
 ## Important Rules
 
 1. **Never break correctness.** Every change must pass all 5 correctness stages.
-2. **Never modify files in `tools/` (harness scripts), `references/`, or `kernels/`.** These are fixed baselines and evaluation harnesses. Save optimized kernels to `kernels_optimized/`.
+2. **During kernel optimization tasks, never modify files in `tools/` (harness scripts), `references/`, or `kernels/`.** These are fixed baselines and evaluation harnesses. Save optimized kernels to `kernels_optimized/`. Framework-maintenance tasks are the explicit exception and must keep harness behavior documented and tested.
 3. **One change at a time.** Isolate variables to understand causality.
 4. **Always commit before benchmarking.** Commit both `kernel.py` and `kernel.cu` (if present). This enables clean reverts.
 5. **Read per-kernel log before each experiment.** Check `memory/<kernel_type>.md` to learn from past attempts on this kernel.
