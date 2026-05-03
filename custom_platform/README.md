@@ -89,13 +89,15 @@ The experiment loop writes:
 - [docs/compute_optimization.md](/home/et/cuda/cuda-kernel-agent/cuda-evolve-oss/custom_platform/docs/compute_optimization.md)
 - [docs/memory_optimization.md](/home/et/cuda/cuda-kernel-agent/cuda-evolve-oss/custom_platform/docs/memory_optimization.md)
 - [docs/stall_reasons.md](/home/et/cuda/cuda-kernel-agent/cuda-evolve-oss/custom_platform/docs/stall_reasons.md)
+- [docs/prototype_ladder.md](/home/et/cuda/cuda-kernel-agent/cuda-evolve-oss/custom_platform/docs/prototype_ladder.md)
+- [docs/architecture_route_plan_template.md](/home/et/cuda/cuda-kernel-agent/cuda-evolve-oss/custom_platform/docs/architecture_route_plan_template.md)
 - [docs/experiment_artifacts.md](/home/et/cuda/cuda-kernel-agent/cuda-evolve-oss/custom_platform/docs/experiment_artifacts.md)
 - [docs/strategy_memory.md](/home/et/cuda/cuda-kernel-agent/cuda-evolve-oss/custom_platform/docs/strategy_memory.md)
 - [knowledge/custom_platform/OPTIMIZATION.md](/home/et/cuda/cuda-kernel-agent/cuda-evolve-oss/custom_platform/knowledge/custom_platform/OPTIMIZATION.md)
 
 ## Current State
 
-- The framework now includes preflight checks, per-run artifact directories, structured strategy memory, and markdown summaries.
+- The framework now includes preflight checks, per-run artifact directories, structured strategy memory, architecture-route state, design-boundary guards, and markdown summaries.
 - The custom hardware implementation is still intentionally missing.
 - A software-only `mock_platform` is included so the full workflow can be rehearsed without vendor hardware.
 - Any method that depends on the real platform raises a descriptive placeholder error until you implement it.
