@@ -87,7 +87,7 @@ flowchart TB
     Agent --> PlatformKnowledge["platform optimization knowledge - 平台优化知识库"]
     Agent --> KernelMemory["memory/kernel_type.md - 单算子历史"]
     Agent --> GlobalMemory["workspace/MEMORY.md - 全局摘要"]
-    StrategyTool --> StrategyMemory["global_strategy_memory.json - positive/negative/rejected"]
+    StrategyTool --> StrategyMemory["global_strategy_memory.json - positive/negative/rejected/inconclusive/routes"]
 
     RunLoop --> Artifacts["workspace/runs/run_xxx/iter_vN - 每轮工件"]
     RunLoop --> Results["workspace/results.tsv - 机器可读结果索引"]
@@ -260,6 +260,9 @@ flowchart TB
 - `positive`：通过正确性，性能超过保留阈值，且 profiling 证据完整。
 - `negative`：正确但性能持平或更差。
 - `rejected`：正确性失败、编译失败、profiling 缺失、违反规则或证据不完整。
+- `inconclusive`：架构路线的非 validation 子迭代失败、性能回退或噪声过大，但不能阻断整个路线。
+- `routes`：记录架构路线的 invariant、预算、停止条件、子迭代证据与当前状态。
+- `design_boundary`：记录当前 kernel 是否处于设计边界受限状态；若为 active，普通局部实验默认应被拦截。
 
 每条记录应包含：
 
@@ -270,12 +273,15 @@ flowchart TB
 - macro 指标和 profile 摘要。
 - outcome 与 reason。
 - 是否属于相邻策略、是否有新证据推翻旧结论。
+- architecture route 元数据：route id、invariant、预算、角色、route plan 与 validation 状态。
+- design boundary 状态：是否 active、原因、标记/清除时间。
 
 注意点：
 
 - 不要只做精确 fingerprint 匹配。一个失败策略会阻断邻近策略，除非 profiling 证明瓶颈已移动。
 - 邻近策略包括同一热点循环的不同 unroll、同一布局族的不同 pitch、同一 tile sweep、同一资源 hint、同一边界特化、同一低覆盖路径变体。
 - 重新尝试邻近失败方向时，proposal 必须写明旧失败记录、新证据和理论收益上限。
+- 当 profile 或性能模型显示当前实现存在结构性设计边界时，应先标记 `design_boundary` 并启动 `architecture-route`，不要继续消耗轮次做局部微调。
 
 ## 必需文档清单
 
@@ -488,8 +494,11 @@ profile_report
 
 - strategy tag 规范。
 - fingerprint 规则。
-- positive/negative/rejected 定义。
+- positive/negative/rejected/inconclusive 定义。
+- routes 与 design_boundary 状态模型。
 - negative-neighborhood rule。
+- negative evidence scope。
+- architecture route budget 与 validation gate。
 - impact gate。
 - generality gate。
 - source/IR/instruction attribution 要求。
@@ -749,7 +758,7 @@ flowchart TD
 - `tools/profile.py` 能生成真实 profiler 报告和规范化摘要。
 - `tools/run_loop.py` 能生成 run/iter 工件并更新结果表。
 - `workspace/optimization_proposal.template.md` 包含 impact、generality、history、priority 相关字段。
-- `workspace/strategy_memory/global_strategy_memory.json` 能记录 positive/negative/rejected。
+- `workspace/strategy_memory/global_strategy_memory.json` 能记录 positive/negative/rejected/inconclusive、routes 与 design_boundary。
 - `knowledge/<platform_name>/OPTIMIZATION.md` 至少包含平台峰值、执行模型、存储层级、常见瓶颈和初始策略。
 - 至少一个示例算子能完成 baseline、一次失败实验、一次成功或有效 negative 实验的完整闭环。
 

@@ -186,6 +186,18 @@ Describe:
 - instruction throughput bottlenecks
 - divergence model
 
+### `docs/prototype_ladder.md`
+
+Keep this file platform-neutral. It should define the staged progression from
+correct baseline to ownership, locality, hot-state residency, hardware
+primitive, layout, pipeline, scheduling, and only then local cleanup.
+
+### `docs/architecture_route_plan_template.md`
+
+Keep this file aligned with `tools/run_loop.py --architecture-route`. It must
+describe route invariants, prototype-ladder state, promotion gates, negative
+evidence scope, budget, and stop conditions.
+
 ### `docs/stall_reasons.md`
 
 Translate profiler stall metrics into human-usable meanings:
@@ -205,6 +217,7 @@ Keep this file aligned with:
 - `workspace/strategy_memory/global_strategy_memory.json`
 - `tools/strategy_memory.py`
 - the proposal tagging workflow
+- architecture-route and design-boundary state
 
 ## 5. Knowledge Base To Maintain
 

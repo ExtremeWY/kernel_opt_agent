@@ -16,7 +16,7 @@ run.log
 *.ncu-rep
 *.nsys-rep
 *.sqlite
-*.csv 
+*.csv
 *.json
 
 LOCAL.md

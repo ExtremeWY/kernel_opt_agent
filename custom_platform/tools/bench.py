@@ -6,6 +6,7 @@ import argparse
 import importlib
 import json
 import os
+import statistics
 import sys
 import time
 import traceback
@@ -208,6 +209,76 @@ def run_correctness(kernel_fn: Callable, config: dict[str, Any], device: str) ->
     }
 
 
+def _format_ms_list(values: list[float]) -> str:
+    return ",".join(f"{float(v):.4f}" for v in values)
+
+
+def _summarize_trial_stats(
+    trial_ms: list[float],
+    *,
+    warmup: int,
+    rep: int,
+    stability_threshold_pct: float,
+    timing_source: str,
+) -> dict[str, Any]:
+    if not trial_ms:
+        trial_ms = [0.0]
+
+    values = [float(v) for v in trial_ms]
+    sorted_values = sorted(values)
+    avg_ms = sum(values) / len(values)
+    median_ms = float(statistics.median(sorted_values))
+    min_ms = sorted_values[0]
+    max_ms = sorted_values[-1]
+    std_ms = float(statistics.pstdev(values)) if len(values) > 1 else 0.0
+    cv_pct = (std_ms / avg_ms * 100.0) if avg_ms > 0 else 0.0
+    spread_pct = ((max_ms - min_ms) / median_ms * 100.0) if median_ms > 0 else 0.0
+    stable = spread_pct <= stability_threshold_pct
+
+    return {
+        "average_ms": avg_ms,
+        "median_ms": median_ms,
+        "min_ms": min_ms,
+        "max_ms": max_ms,
+        "std_ms": std_ms,
+        "cv_pct": cv_pct,
+        "spread_pct": spread_pct,
+        "stable": stable,
+        "trials_ms": values,
+        "trial_count": len(values),
+        "warmup": warmup,
+        "rep": rep,
+        "stability_threshold_pct": stability_threshold_pct,
+        "timing_source": timing_source,
+    }
+
+
+def _benchmark_trials(
+    adapter,
+    fn: Callable[[], Any],
+    *,
+    warmup: int,
+    rep: int,
+    trials: int,
+    stability_threshold_pct: float,
+) -> dict[str, Any]:
+    warmup = max(0, int(warmup))
+    rep = max(1, int(rep))
+    trials = max(1, int(trials))
+    values: list[float] = []
+    for _ in range(trials):
+        adapter.synchronize()
+        values.append(float(adapter.benchmark(fn, warmup=warmup, rep=rep)))
+        adapter.synchronize()
+    return _summarize_trial_stats(
+        values,
+        warmup=warmup,
+        rep=rep,
+        stability_threshold_pct=stability_threshold_pct,
+        timing_source=f"{getattr(adapter, 'platform_name', 'platform')}.benchmark",
+    )
+
+
 def _result_payload(
     kernel_type: str,
     target_platform: str,
@@ -223,6 +294,8 @@ def _result_payload(
     primary_size_label: str = "",
     primary_size: dict[str, Any] | None = None,
     compute_traits: dict[str, Any] | None = None,
+    benchmark_mode: str = "full",
+    bench_config: dict[str, Any] | None = None,
     error: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     peak_compute = float(getattr(device_spec, "peak_tflops_fp16", 0.0) or 0.0)
@@ -250,6 +323,10 @@ def _result_payload(
         "primary_size_label": primary_size_label,
         "primary_size": primary_size or {},
         "compute_traits": compute_traits or {},
+        "benchmark_mode": benchmark_mode,
+        "bench_config": bench_config or {},
+        "timing_stable": bool(kernel_stats.get("stable", False)) if kernel_stats else False,
+        "timing_spread_pct": float(kernel_stats.get("spread_pct", 0.0) or 0.0) if kernel_stats else 0.0,
         "bench_time_seconds": bench_time_seconds,
         "error": error,
     }
@@ -260,11 +337,30 @@ def main() -> None:
     parser.add_argument("--platform", default="custom_platform")
     parser.add_argument("--kernel", default=None)
     parser.add_argument("--json-out", default=None)
+    parser.add_argument("--bench-warmup", type=int, default=25)
+    parser.add_argument("--bench-rep", type=int, default=100)
+    parser.add_argument("--bench-trials", type=int, default=3)
+    parser.add_argument("--stability-threshold-pct", type=float, default=1.5)
     args = parser.parse_args()
+    bench_warmup = max(0, int(args.bench_warmup))
+    bench_rep = max(1, int(args.bench_rep))
+    bench_trials = max(1, int(args.bench_trials))
+    stability_threshold_pct = max(0.0, float(args.stability_threshold_pct))
+    bench_config = {
+        "warmup": bench_warmup,
+        "rep": bench_rep,
+        "trials": bench_trials,
+        "stability_threshold_pct": stability_threshold_pct,
+    }
 
     print("=" * 60)
     print("custom_platform Benchmark Harness")
     print("=" * 60)
+    print(
+        "bench_config: "
+        f"warmup={bench_warmup}, rep={bench_rep}, trials={bench_trials}, "
+        f"stability_threshold_pct={stability_threshold_pct:.2f}"
+    )
 
     adapter = get_platform_adapter(args.platform)
     payload: dict[str, Any] = {}
@@ -388,14 +484,27 @@ def main() -> None:
 
         adapter.reset_peak_memory_stats()
         t0 = time.time()
-        kernel_ms = adapter.benchmark(lambda: kernel_fn(**inputs))
-        adapter.synchronize()
+        kernel_stats = _benchmark_trials(
+            adapter,
+            lambda: kernel_fn(**inputs),
+            warmup=bench_warmup,
+            rep=bench_rep,
+            trials=bench_trials,
+            stability_threshold_pct=stability_threshold_pct,
+        )
         wall_s = time.time() - t0
         peak_vram_mb = adapter.get_peak_memory_mb()
 
-        reference_ms = adapter.benchmark(lambda: ref_fn(inputs))
-        adapter.synchronize()
+        reference_stats = _benchmark_trials(
+            adapter,
+            lambda: ref_fn(inputs),
+            warmup=bench_warmup,
+            rep=bench_rep,
+            trials=bench_trials,
+            stability_threshold_pct=stability_threshold_pct,
+        )
 
+        kernel_ms = float(kernel_stats["median_ms"])
         throughput_tflops = flops / (kernel_ms / 1000.0) / 1e12 if kernel_ms > 0 else 0.0
         bandwidth_gb_s = nbytes / (kernel_ms / 1000.0) / 1e9 if kernel_ms > 0 else 0.0
         peak_compute = float(device_spec.peak_tflops_fp16 or 0.0)
@@ -416,19 +525,7 @@ def main() -> None:
             bench_metrics=bench_metrics,
         )
 
-        kernel_stats = {
-            "average_ms": kernel_ms,
-            "median_ms": kernel_ms,
-            "min_ms": kernel_ms,
-            "max_ms": kernel_ms,
-            "label": label,
-        }
-        reference_stats = {
-            "average_ms": reference_ms,
-            "median_ms": reference_ms,
-            "min_ms": reference_ms,
-            "max_ms": reference_ms,
-        }
+        kernel_stats["label"] = label
         payload = _result_payload(
             kernel_type=kernel_type,
             target_platform=target_platform,
@@ -444,9 +541,18 @@ def main() -> None:
             primary_size_label=label,
             primary_size=size,
             compute_traits=benchmark_compute_traits,
+            bench_config=bench_config,
         )
 
         print(f"latency_ms: {kernel_ms:.4f}")
+        print(f"kernel_timing_trials_ms: {_format_ms_list(kernel_stats['trials_ms'])}")
+        print(f"kernel_timing_spread_pct: {kernel_stats['spread_pct']:.2f}")
+        print(f"kernel_timing_cv_pct: {kernel_stats['cv_pct']:.2f}")
+        print(f"kernel_timing_stable: {'yes' if kernel_stats['stable'] else 'no'}")
+        print(f"reference_timing_trials_ms: {_format_ms_list(reference_stats['trials_ms'])}")
+        print(f"reference_timing_spread_pct: {reference_stats['spread_pct']:.2f}")
+        print(f"reference_timing_cv_pct: {reference_stats['cv_pct']:.2f}")
+        print(f"reference_timing_stable: {'yes' if reference_stats['stable'] else 'no'}")
         print(f"throughput_tflops: {throughput_tflops:.3f}")
         print(f"bandwidth_gb_s: {bandwidth_gb_s:.1f}")
         print(f"peak_vram_mb: {peak_vram_mb:.1f}")

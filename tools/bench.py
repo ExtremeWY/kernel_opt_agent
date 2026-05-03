@@ -5,7 +5,7 @@ bench.py -- cuda-evolve benchmark harness.
 Handles:
   1. GPU hardware detection and roofline modelling
   2. Correctness verification (5 stages)
-  3. Performance benchmarking (Triton do_bench)
+  3. Performance benchmarking (multi-trial timing with stability checks)
   4. Structured, greppable output for the agent loop
 
 Usage:
@@ -23,6 +23,7 @@ import importlib
 import json
 import os
 import signal
+import statistics
 import sys
 import time
 import traceback
@@ -96,13 +97,27 @@ def _error_payload(code: str, stage: str, message: str, kernel_type: str | None 
             "median_ms": 0.0,
             "min_ms": 0.0,
             "max_ms": 0.0,
+            "std_ms": 0.0,
+            "cv_pct": 0.0,
+            "spread_pct": 0.0,
+            "stable": False,
+            "trials_ms": [],
         },
         "reference": {
             "average_ms": 0.0,
             "median_ms": 0.0,
             "min_ms": 0.0,
             "max_ms": 0.0,
+            "std_ms": 0.0,
+            "cv_pct": 0.0,
+            "spread_pct": 0.0,
+            "stable": False,
+            "trials_ms": [],
         },
+        "benchmark_mode": "",
+        "bench_config": {},
+        "timing_stable": False,
+        "timing_spread_pct": 0.0,
         "speedup_vs_pytorch": 0.0,
         "throughput_tflops": 0.0,
         "bandwidth_gb_s": 0.0,
@@ -348,7 +363,6 @@ def _default_numerical_stability_cases(
         ("all_zeros", _transform_floating_tensors(base_inputs, torch.zeros_like)),
         ("all_same", _transform_floating_tensors(base_inputs, lambda t: torch.full_like(t, 0.5))),
     ]
-
 
 def _numerical_stability_cases(config: dict, gen_fn: Callable, size: dict, dtype: torch.dtype, device: str) -> list[tuple[str, dict]]:
     case_builder = config.get("numerical_stability_cases")
@@ -705,46 +719,119 @@ def _peak_tflops_for_dtype(gpu: GPUSpec, dtype: torch.dtype) -> float:
     return gpu.peak_tflops_fp16
 
 
-def _do_bench(fn: Callable, warmup: int = 25, rep: int = 100) -> dict:
-    """Benchmark a function and return timing statistics in milliseconds."""
-    try:
-        from triton.testing import do_bench
-        ms = do_bench(fn, warmup=warmup, rep=rep)
-        ms_f = float(ms)
-        return {
-            "average_ms": ms_f,
-            "median_ms": ms_f,
-            "min_ms": ms_f,
-            "max_ms": ms_f,
-        }
-    except ImportError:
-        pass
+def _format_ms_list(values: list[float]) -> str:
+    return ",".join(f"{float(v):.4f}" for v in values)
 
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
 
-    times = []
-    for _ in range(rep):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        fn()
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
+def _summarize_trial_stats(
+    trial_ms: list[float],
+    *,
+    warmup: int,
+    rep: int,
+    stability_threshold_pct: float,
+    timing_source: str,
+) -> dict:
+    """Summarize independent benchmark trials in milliseconds."""
+    if not trial_ms:
+        trial_ms = [0.0]
 
-    times.sort()
+    values = [float(v) for v in trial_ms]
+    sorted_values = sorted(values)
+    avg_ms = sum(values) / len(values)
+    median_ms = float(statistics.median(sorted_values))
+    min_ms = sorted_values[0]
+    max_ms = sorted_values[-1]
+    std_ms = float(statistics.pstdev(values)) if len(values) > 1 else 0.0
+    cv_pct = (std_ms / avg_ms * 100.0) if avg_ms > 0 else 0.0
+    spread_pct = ((max_ms - min_ms) / median_ms * 100.0) if median_ms > 0 else 0.0
+    stable = spread_pct <= stability_threshold_pct
+
     return {
-        "average_ms": sum(times) / len(times),
-        "median_ms": times[len(times) // 2],
-        "min_ms": times[0],
-        "max_ms": times[-1],
+        "average_ms": avg_ms,
+        "median_ms": median_ms,
+        "min_ms": min_ms,
+        "max_ms": max_ms,
+        "std_ms": std_ms,
+        "cv_pct": cv_pct,
+        "spread_pct": spread_pct,
+        "stable": stable,
+        "trials_ms": values,
+        "trial_count": len(values),
+        "warmup": warmup,
+        "rep": rep,
+        "stability_threshold_pct": stability_threshold_pct,
+        "timing_source": timing_source,
     }
 
 
-def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
-                    sizes_filter: str = "all") -> dict:
+def _do_bench(
+    fn: Callable,
+    warmup: int = 25,
+    rep: int = 100,
+    trials: int = 3,
+    stability_threshold_pct: float = 1.5,
+) -> dict:
+    """Benchmark a function and return robust timing statistics in milliseconds."""
+    warmup = max(0, int(warmup))
+    rep = max(1, int(rep))
+    trials = max(1, int(trials))
+
+    try:
+        from triton.testing import do_bench
+    except ImportError:
+        do_bench = None
+
+    trial_ms: list[float] = []
+    if do_bench is not None:
+        for _ in range(trials):
+            torch.cuda.synchronize()
+            trial_ms.append(float(do_bench(fn, warmup=warmup, rep=rep)))
+            torch.cuda.synchronize()
+        return _summarize_trial_stats(
+            trial_ms,
+            warmup=warmup,
+            rep=rep,
+            stability_threshold_pct=stability_threshold_pct,
+            timing_source="triton.do_bench",
+        )
+
+    for _ in range(trials):
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+
+        times = []
+        for _ in range(rep):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            torch.cuda.synchronize()
+            times.append(float(start.elapsed_time(end)))
+
+        times.sort()
+        trial_ms.append(float(statistics.median(times)))
+
+    return _summarize_trial_stats(
+        trial_ms,
+        warmup=warmup,
+        rep=rep,
+        stability_threshold_pct=stability_threshold_pct,
+        timing_source="torch.cuda.Event",
+    )
+
+
+def run_performance(
+    kernel_fn: Callable,
+    config: dict,
+    gpu: GPUSpec,
+    sizes_filter: str = "all",
+    bench_warmup: int = 25,
+    bench_rep: int = 100,
+    bench_trials: int = 3,
+    stability_threshold_pct: float = 1.5,
+) -> dict:
     device = "cuda"
     gen_fn = config["input_generator"]
     ref_fn = config["reference_fn"]
@@ -793,10 +880,22 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
 
             _k_inputs = inputs
             with _Timeout(30):
-                kernel_stats = _do_bench(lambda _i=_k_inputs: kernel_fn(**_i), warmup=25, rep=100)
+                kernel_stats = _do_bench(
+                    lambda _i=_k_inputs: kernel_fn(**_i),
+                    warmup=bench_warmup,
+                    rep=bench_rep,
+                    trials=bench_trials,
+                    stability_threshold_pct=stability_threshold_pct,
+                )
 
             with _Timeout(30):
-                ref_stats = _do_bench(lambda _i=_k_inputs: ref_fn(_i), warmup=25, rep=100)
+                ref_stats = _do_bench(
+                    lambda _i=_k_inputs: ref_fn(_i),
+                    warmup=bench_warmup,
+                    rep=bench_rep,
+                    trials=bench_trials,
+                    stability_threshold_pct=stability_threshold_pct,
+                )
 
             kernel_ms = kernel_stats["median_ms"]
             ref_ms = ref_stats["median_ms"]
@@ -831,10 +930,26 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
                 "kernel_median_ms": kernel_stats["median_ms"],
                 "kernel_min_ms": kernel_stats["min_ms"],
                 "kernel_max_ms": kernel_stats["max_ms"],
+                "kernel_std_ms": kernel_stats["std_ms"],
+                "kernel_cv_pct": kernel_stats["cv_pct"],
+                "kernel_timing_spread_pct": kernel_stats["spread_pct"],
+                "kernel_timing_stable": kernel_stats["stable"],
+                "kernel_timing_trials_ms": kernel_stats["trials_ms"],
+                "kernel_timing_source": kernel_stats["timing_source"],
                 "reference_average_ms": ref_stats["average_ms"],
                 "reference_median_ms": ref_stats["median_ms"],
                 "reference_min_ms": ref_stats["min_ms"],
                 "reference_max_ms": ref_stats["max_ms"],
+                "reference_std_ms": ref_stats["std_ms"],
+                "reference_cv_pct": ref_stats["cv_pct"],
+                "reference_timing_spread_pct": ref_stats["spread_pct"],
+                "reference_timing_stable": ref_stats["stable"],
+                "reference_timing_trials_ms": ref_stats["trials_ms"],
+                "reference_timing_source": ref_stats["timing_source"],
+                "bench_warmup": bench_warmup,
+                "bench_rep": bench_rep,
+                "bench_trials": bench_trials,
+                "stability_threshold_pct": stability_threshold_pct,
                 "kernel_latency_us": kernel_us,
                 "pytorch_latency_us": ref_us,
                 "throughput_tflops": throughput_tflops,
@@ -855,6 +970,23 @@ def run_performance(kernel_fn: Callable, config: dict, gpu: GPUSpec,
             print(f"    kernel: {kernel_us:.2f} us | pytorch: {ref_us:.2f} us | "
                   f"speedup: {speedup:.3f}x | {throughput_tflops:.3f} TFLOPS | "
                   f"{pct_peak_compute:.1f}% peak")
+            print(
+                f"    kernel timing trials ms: [{_format_ms_list(kernel_stats['trials_ms'])}] | "
+                f"spread: {kernel_stats['spread_pct']:.2f}% | "
+                f"cv: {kernel_stats['cv_pct']:.2f}% | "
+                f"stable: {'yes' if kernel_stats['stable'] else 'no'}"
+            )
+            print(
+                f"    reference timing trials ms: [{_format_ms_list(ref_stats['trials_ms'])}] | "
+                f"spread: {ref_stats['spread_pct']:.2f}% | "
+                f"cv: {ref_stats['cv_pct']:.2f}% | "
+                f"stable: {'yes' if ref_stats['stable'] else 'no'}"
+            )
+            if not kernel_stats["stable"]:
+                print(
+                    "    WARNING: kernel timing is unstable; treat this benchmark as directional "
+                    "and run full/stable validation before keep/revert."
+                )
 
         except torch.cuda.OutOfMemoryError:
             print(f"    SKIP: {label} -> OOM")
@@ -950,8 +1082,31 @@ def main():
                         help="Print machine-readable error fields on failure")
     parser.add_argument("--gpu", type=int, default=0,
                         help="CUDA device index to benchmark on")
+    parser.add_argument("--bench-warmup", type=int, default=None,
+                        help="Warmup iterations per timing trial (default: 25)")
+    parser.add_argument("--bench-rep", type=int, default=None,
+                        help="Measured repetitions per timing trial (default: 100)")
+    parser.add_argument("--bench-trials", type=int, default=None,
+                        help="Independent timing trials. Overrides --quick-bench-trials when set")
+    parser.add_argument("--quick-bench-trials", type=int, default=5,
+                        help="Independent timing trials for --quick when --bench-trials is unset (default: 5)")
+    parser.add_argument("--stability-threshold-pct", type=float, default=1.5,
+                        help="Max trial spread percentage considered timing-stable (default: 1.5)")
     args = parser.parse_args()
     json_out = args.json_out
+    bench_warmup = args.bench_warmup if args.bench_warmup is not None else 25
+    bench_rep = args.bench_rep if args.bench_rep is not None else 100
+    if args.bench_trials is not None:
+        bench_trials = args.bench_trials
+    elif args.quick:
+        bench_trials = args.quick_bench_trials
+    else:
+        bench_trials = 3
+    bench_warmup = max(0, int(bench_warmup))
+    bench_rep = max(1, int(bench_rep))
+    bench_trials = max(1, int(bench_trials))
+    stability_threshold_pct = max(0.0, float(args.stability_threshold_pct))
+    benchmark_mode = "quick" if args.quick else "full"
 
     # ------------------------------------------------------------------
     # Import the kernel module
@@ -959,6 +1114,11 @@ def main():
     print("=" * 60)
     print("cuda-evolve Benchmark Harness")
     print("=" * 60)
+    print(f"benchmark_mode: {benchmark_mode}")
+    print(
+        f"bench_config: warmup={bench_warmup}, rep={bench_rep}, "
+        f"trials={bench_trials}, stability_threshold_pct={stability_threshold_pct:.2f}"
+    )
 
     if not torch.cuda.is_available():
         message = "No CUDA GPU available"
@@ -1114,7 +1274,16 @@ def main():
         if args.quick:
             sizes_filter = "large"
         torch.cuda.reset_peak_memory_stats()
-        perf_results = run_performance(kernel_fn, config, gpu, sizes_filter=sizes_filter)
+        perf_results = run_performance(
+            kernel_fn,
+            config,
+            gpu,
+            sizes_filter=sizes_filter,
+            bench_warmup=bench_warmup,
+            bench_rep=bench_rep,
+            bench_trials=bench_trials,
+            stability_threshold_pct=stability_threshold_pct,
+        )
         peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
     except Exception as e:
         print(f"\nFATAL: Performance benchmarking crashed: {type(e).__name__}: {e}")
@@ -1145,6 +1314,14 @@ def main():
         print(f"compute_traits_shape_regime: {benchmark_compute_traits['shape_regime']}")
         print(f"flops: {primary['flops']}")
         print(f"bytes: {primary['bytes']}")
+        print(f"kernel_timing_trials_ms: {_format_ms_list(primary['kernel_timing_trials_ms'])}")
+        print(f"kernel_timing_spread_pct: {primary['kernel_timing_spread_pct']:.2f}")
+        print(f"kernel_timing_cv_pct: {primary['kernel_cv_pct']:.2f}")
+        print(f"kernel_timing_stable: {'yes' if primary['kernel_timing_stable'] else 'no'}")
+        print(f"reference_timing_trials_ms: {_format_ms_list(primary['reference_timing_trials_ms'])}")
+        print(f"reference_timing_spread_pct: {primary['reference_timing_spread_pct']:.2f}")
+        print(f"reference_timing_cv_pct: {primary['reference_cv_pct']:.2f}")
+        print(f"reference_timing_stable: {'yes' if primary['reference_timing_stable'] else 'no'}")
         print(f"peak_vram_mb: {peak_vram_mb:.1f}")
 
         print(f"\n=== COMPARISON VS PYTORCH ===")
@@ -1177,12 +1354,14 @@ def main():
     all_perf = perf_results.get("all", [])
     if len(all_perf) > 1:
         print(f"\n=== SIZE SWEEP ===")
-        print(f"{'size':<12} {'kernel_us':>12} {'pytorch_us':>12} {'speedup':>10} {'tflops':>10} {'%peak':>8}")
-        print("-" * 66)
+        print(f"{'size':<12} {'kernel_us':>12} {'pytorch_us':>12} {'speedup':>10} {'tflops':>10} {'%peak':>8} {'spread%':>8} {'stable':>8}")
+        print("-" * 84)
         for entry in all_perf:
             print(f"{entry['label']:<12} {entry['kernel_latency_us']:>12.2f} "
                   f"{entry['pytorch_latency_us']:>12.2f} {entry['speedup_vs_pytorch']:>9.3f}x "
-                  f"{entry['throughput_tflops']:>10.3f} {entry['pct_peak_compute']:>7.1f}%")
+                  f"{entry['throughput_tflops']:>10.3f} {entry['pct_peak_compute']:>7.1f}% "
+                  f"{entry['kernel_timing_spread_pct']:>7.2f}% "
+                  f"{'yes' if entry['kernel_timing_stable'] else 'no':>8}")
 
     # ------------------------------------------------------------------
     # Profiling (optional)
@@ -1201,6 +1380,7 @@ def main():
 
     print(f"\n=== FINAL ===")
     print(f"kernel_type: {kernel_type}")
+    print(f"benchmark_mode: {benchmark_mode}")
     print(f"correctness: {correctness_results['correctness']}")
     print(f"throughput_tflops: {throughput:.3f}")
     if primary:
@@ -1208,6 +1388,11 @@ def main():
         print(f"pct_peak_compute: {primary['pct_peak_compute']:.1f}%")
         print(f"pct_peak_bandwidth: {primary['pct_peak_bandwidth']:.1f}%")
         print(f"bottleneck: {primary['bottleneck']}")
+        print(f"kernel_timing_spread_pct: {primary['kernel_timing_spread_pct']:.2f}")
+        print(f"kernel_timing_cv_pct: {primary['kernel_cv_pct']:.2f}")
+        print(f"kernel_timing_stable: {'yes' if primary['kernel_timing_stable'] else 'no'}")
+        if benchmark_mode == "quick" and not primary["kernel_timing_stable"]:
+            print("WARNING: quick benchmark timing is unstable; run full benchmark before keep/revert.")
         print(f"tensor_core_recommendation: {benchmark_compute_traits['tensor_core_recommendation']}")
         print(f"tensor_core_reasoning: {benchmark_compute_traits['tensor_core_reasoning']}")
         print(f"compute_traits_shape_regime: {benchmark_compute_traits['shape_regime']}")
@@ -1222,6 +1407,13 @@ def main():
 
     payload = {
         "kernel_type": kernel_type,
+        "benchmark_mode": benchmark_mode,
+        "bench_config": {
+            "warmup": bench_warmup,
+            "rep": bench_rep,
+            "trials": bench_trials,
+            "stability_threshold_pct": stability_threshold_pct,
+        },
         "gpu_name": gpu.name,
         "gpu_compute_capability": f"{gpu.compute_capability[0]}.{gpu.compute_capability[1]}",
         "gpu_memory_gb": gpu.memory_gb,
@@ -1244,13 +1436,33 @@ def main():
             "median_ms": float(primary["kernel_median_ms"]) if primary else 0.0,
             "min_ms": float(primary["kernel_min_ms"]) if primary else 0.0,
             "max_ms": float(primary["kernel_max_ms"]) if primary else 0.0,
+            "std_ms": float(primary["kernel_std_ms"]) if primary else 0.0,
+            "cv_pct": float(primary["kernel_cv_pct"]) if primary else 0.0,
+            "spread_pct": float(primary["kernel_timing_spread_pct"]) if primary else 0.0,
+            "stable": bool(primary["kernel_timing_stable"]) if primary else False,
+            "trials_ms": [float(v) for v in primary["kernel_timing_trials_ms"]] if primary else [],
+            "trial_count": int(primary["bench_trials"]) if primary else 0,
+            "warmup": int(primary["bench_warmup"]) if primary else bench_warmup,
+            "rep": int(primary["bench_rep"]) if primary else bench_rep,
+            "timing_source": primary["kernel_timing_source"] if primary else "",
         },
         "reference": {
             "average_ms": float(primary["reference_average_ms"]) if primary else 0.0,
             "median_ms": float(primary["reference_median_ms"]) if primary else 0.0,
             "min_ms": float(primary["reference_min_ms"]) if primary else 0.0,
             "max_ms": float(primary["reference_max_ms"]) if primary else 0.0,
+            "std_ms": float(primary["reference_std_ms"]) if primary else 0.0,
+            "cv_pct": float(primary["reference_cv_pct"]) if primary else 0.0,
+            "spread_pct": float(primary["reference_timing_spread_pct"]) if primary else 0.0,
+            "stable": bool(primary["reference_timing_stable"]) if primary else False,
+            "trials_ms": [float(v) for v in primary["reference_timing_trials_ms"]] if primary else [],
+            "trial_count": int(primary["bench_trials"]) if primary else 0,
+            "warmup": int(primary["bench_warmup"]) if primary else bench_warmup,
+            "rep": int(primary["bench_rep"]) if primary else bench_rep,
+            "timing_source": primary["reference_timing_source"] if primary else "",
         },
+        "timing_stable": bool(primary["kernel_timing_stable"]) if primary else False,
+        "timing_spread_pct": float(primary["kernel_timing_spread_pct"]) if primary else 0.0,
         "speedup_vs_pytorch": float(primary["speedup_vs_pytorch"]) if primary else 0.0,
         "throughput_tflops": float(throughput),
         "bandwidth_gb_s": float(primary["bandwidth_gb_s"]) if primary else 0.0,
