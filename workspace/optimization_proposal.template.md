@@ -45,6 +45,24 @@
 - If this is a high-upside route, route budget and stop condition:
 - Why failures in adjacent old-design experiments do or do not apply:
 
+## Oracle-free architecture discovery
+- operator_dependency_graph:
+- duplicate_work_or_materialization_model:
+- stage_cost_model:
+- external_probe_used: no
+- If an external probe was used, why it is only supporting evidence and not a route prerequisite:
+
+## Route milestone
+- iteration_mode: local_tune / architecture_discovery / architecture_route / external_probe / framework_maintenance
+- milestone: skeleton / precompute_kernel / consumer_kernel / end_to_end_correctness / stage_benchmark / resource_rebalance / validation
+- milestone_status: pending / passed / failed
+- invariant_satisfied: yes / no / unknown
+- old_bottleneck_removed: yes / no / unknown
+- stage_metrics_json:
+- negative_evidence_scope:
+- blocks:
+- does_not_block:
+
 ## This iteration
 - Describe one focused change.
 - State why it should improve performance.

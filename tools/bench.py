@@ -27,6 +27,7 @@ import statistics
 import sys
 import time
 import traceback
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Tuple
@@ -723,6 +724,59 @@ def _format_ms_list(values: list[float]) -> str:
     return ",".join(f"{float(v):.4f}" for v in values)
 
 
+def _trimmed_mean(values: list[float], trim_fraction: float = 0.10) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(float(v) for v in values)
+    trim = int(len(sorted_values) * trim_fraction)
+    if trim <= 0 or len(sorted_values) - 2 * trim <= 0:
+        kept = sorted_values
+    else:
+        kept = sorted_values[trim:-trim]
+    return float(sum(kept) / len(kept))
+
+
+def _summarize_ratio_stats(
+    values: list[float],
+    *,
+    stability_threshold_pct: float,
+    timing_source: str,
+) -> dict:
+    """Summarize dimensionless paired ratios, usually reference_ms / kernel_ms."""
+    if not values:
+        values = [0.0]
+
+    ratios = [float(v) for v in values]
+    sorted_values = sorted(ratios)
+    avg = sum(ratios) / len(ratios)
+    median = float(statistics.median(sorted_values))
+    min_v = sorted_values[0]
+    max_v = sorted_values[-1]
+    std = float(statistics.pstdev(ratios)) if len(ratios) > 1 else 0.0
+    stderr = std / math.sqrt(len(ratios)) if len(ratios) > 1 else 0.0
+    cv_pct = (std / avg * 100.0) if avg > 0 else 0.0
+    relative_ci95_pct = (1.96 * stderr / avg * 100.0) if avg > 0 else 0.0
+    spread_pct = ((max_v - min_v) / median * 100.0) if median > 0 else 0.0
+
+    return {
+        "average": avg,
+        "median": median,
+        "trimmed_mean": _trimmed_mean(ratios),
+        "min": min_v,
+        "max": max_v,
+        "std": std,
+        "stderr": stderr,
+        "relative_ci95_pct": relative_ci95_pct,
+        "cv_pct": cv_pct,
+        "spread_pct": spread_pct,
+        "stable": spread_pct <= stability_threshold_pct,
+        "trials": ratios,
+        "trial_count": len(ratios),
+        "stability_threshold_pct": stability_threshold_pct,
+        "timing_source": timing_source,
+    }
+
+
 def _summarize_trial_stats(
     trial_ms: list[float],
     *,
@@ -742,16 +796,21 @@ def _summarize_trial_stats(
     min_ms = sorted_values[0]
     max_ms = sorted_values[-1]
     std_ms = float(statistics.pstdev(values)) if len(values) > 1 else 0.0
+    stderr_ms = std_ms / math.sqrt(len(values)) if len(values) > 1 else 0.0
     cv_pct = (std_ms / avg_ms * 100.0) if avg_ms > 0 else 0.0
+    relative_ci95_pct = (1.96 * stderr_ms / avg_ms * 100.0) if avg_ms > 0 else 0.0
     spread_pct = ((max_ms - min_ms) / median_ms * 100.0) if median_ms > 0 else 0.0
     stable = spread_pct <= stability_threshold_pct
 
     return {
         "average_ms": avg_ms,
+        "trimmed_mean_ms": _trimmed_mean(values),
         "median_ms": median_ms,
         "min_ms": min_ms,
         "max_ms": max_ms,
         "std_ms": std_ms,
+        "stderr_ms": stderr_ms,
+        "relative_ci95_pct": relative_ci95_pct,
         "cv_pct": cv_pct,
         "spread_pct": spread_pct,
         "stable": stable,
@@ -822,6 +881,113 @@ def _do_bench(
     )
 
 
+def _do_bench_pair(
+    kernel_fn: Callable,
+    ref_fn: Callable,
+    warmup: int = 25,
+    rep: int = 100,
+    trials: int = 3,
+    stability_threshold_pct: float = 1.5,
+    max_trials: int | None = None,
+    target_ci_pct: float = 1.0,
+    adaptive_trials: bool = True,
+) -> tuple[dict, dict, dict]:
+    """Benchmark kernel/reference as adjacent pairs and summarize paired speedups."""
+    warmup = max(0, int(warmup))
+    rep = max(1, int(rep))
+    min_trials = max(1, int(trials))
+    if max_trials is None:
+        max_trials = min_trials
+    max_trials = max(min_trials, int(max_trials))
+    target_ci_pct = max(0.0, float(target_ci_pct))
+
+    try:
+        from triton.testing import do_bench
+    except ImportError:
+        do_bench = None
+
+    kernel_ms: list[float] = []
+    ref_ms: list[float] = []
+    paired_speedups: list[float] = []
+    trial_orders: list[str] = []
+
+    trial = 0
+    while trial < max_trials:
+        torch.cuda.synchronize()
+        if do_bench is not None:
+            if trial % 2 == 0:
+                km = float(do_bench(kernel_fn, warmup=warmup, rep=rep))
+                torch.cuda.synchronize()
+                rm = float(do_bench(ref_fn, warmup=warmup, rep=rep))
+                order = "kernel_then_reference"
+            else:
+                rm = float(do_bench(ref_fn, warmup=warmup, rep=rep))
+                torch.cuda.synchronize()
+                km = float(do_bench(kernel_fn, warmup=warmup, rep=rep))
+                order = "reference_then_kernel"
+        else:
+            if trial % 2 == 0:
+                km = float(_do_bench(kernel_fn, warmup=warmup, rep=rep, trials=1,
+                                     stability_threshold_pct=stability_threshold_pct)["median_ms"])
+                rm = float(_do_bench(ref_fn, warmup=warmup, rep=rep, trials=1,
+                                     stability_threshold_pct=stability_threshold_pct)["median_ms"])
+                order = "kernel_then_reference"
+            else:
+                rm = float(_do_bench(ref_fn, warmup=warmup, rep=rep, trials=1,
+                                     stability_threshold_pct=stability_threshold_pct)["median_ms"])
+                km = float(_do_bench(kernel_fn, warmup=warmup, rep=rep, trials=1,
+                                     stability_threshold_pct=stability_threshold_pct)["median_ms"])
+                order = "reference_then_kernel"
+        torch.cuda.synchronize()
+
+        kernel_ms.append(km)
+        ref_ms.append(rm)
+        paired_speedups.append(rm / km if km > 0 else 0.0)
+        trial_orders.append(order)
+        trial += 1
+
+        if trial >= min_trials:
+            pair_stats = _summarize_ratio_stats(
+                paired_speedups,
+                stability_threshold_pct=stability_threshold_pct,
+                timing_source="paired.triton.do_bench" if do_bench is not None else "paired.torch.cuda.Event",
+            )
+            if not adaptive_trials or pair_stats["relative_ci95_pct"] <= target_ci_pct:
+                break
+
+    kernel_stats = _summarize_trial_stats(
+        kernel_ms,
+        warmup=warmup,
+        rep=rep,
+        stability_threshold_pct=stability_threshold_pct,
+        timing_source="paired.triton.do_bench" if do_bench is not None else "paired.torch.cuda.Event",
+    )
+    ref_stats = _summarize_trial_stats(
+        ref_ms,
+        warmup=warmup,
+        rep=rep,
+        stability_threshold_pct=stability_threshold_pct,
+        timing_source="paired.triton.do_bench" if do_bench is not None else "paired.torch.cuda.Event",
+    )
+    pair_stats = _summarize_ratio_stats(
+        paired_speedups,
+        stability_threshold_pct=stability_threshold_pct,
+        timing_source="paired.triton.do_bench" if do_bench is not None else "paired.torch.cuda.Event",
+    )
+    pair_stats["spread_stable"] = pair_stats["stable"]
+    pair_stats["ci_stable"] = pair_stats["relative_ci95_pct"] <= target_ci_pct
+    pair_stats["stable"] = bool(pair_stats["spread_stable"] and pair_stats["ci_stable"])
+    pair_stats["trial_orders"] = trial_orders
+    pair_stats["adaptive_trials"] = adaptive_trials
+    pair_stats["min_trials"] = min_trials
+    pair_stats["max_trials"] = max_trials
+    pair_stats["target_ci_pct"] = target_ci_pct
+    pair_stats["stopped_by_target_ci"] = bool(
+        adaptive_trials and len(paired_speedups) < max_trials and pair_stats["relative_ci95_pct"] <= target_ci_pct
+    )
+    return kernel_stats, ref_stats, pair_stats
+
+
 def run_performance(
     kernel_fn: Callable,
     config: dict,
@@ -831,6 +997,10 @@ def run_performance(
     bench_rep: int = 100,
     bench_trials: int = 3,
     stability_threshold_pct: float = 1.5,
+    paired_benchmark: bool = True,
+    max_bench_trials: int | None = None,
+    target_ci_pct: float = 1.0,
+    adaptive_trials: bool = True,
 ) -> dict:
     device = "cuda"
     gen_fn = config["input_generator"]
@@ -879,22 +1049,41 @@ def run_performance(
             inputs = gen_fn(sz, dtype, device, seed=42)
 
             _k_inputs = inputs
-            with _Timeout(30):
-                kernel_stats = _do_bench(
-                    lambda _i=_k_inputs: kernel_fn(**_i),
-                    warmup=bench_warmup,
-                    rep=bench_rep,
-                    trials=bench_trials,
-                    stability_threshold_pct=stability_threshold_pct,
-                )
+            if paired_benchmark:
+                with _Timeout(300):
+                    kernel_stats, ref_stats, pair_stats = _do_bench_pair(
+                        lambda _i=_k_inputs: kernel_fn(**_i),
+                        lambda _i=_k_inputs: ref_fn(_i),
+                        warmup=bench_warmup,
+                        rep=bench_rep,
+                        trials=bench_trials,
+                        stability_threshold_pct=stability_threshold_pct,
+                        max_trials=max_bench_trials,
+                        target_ci_pct=target_ci_pct,
+                        adaptive_trials=adaptive_trials,
+                    )
+            else:
+                with _Timeout(30):
+                    kernel_stats = _do_bench(
+                        lambda _i=_k_inputs: kernel_fn(**_i),
+                        warmup=bench_warmup,
+                        rep=bench_rep,
+                        trials=bench_trials,
+                        stability_threshold_pct=stability_threshold_pct,
+                    )
 
-            with _Timeout(30):
-                ref_stats = _do_bench(
-                    lambda _i=_k_inputs: ref_fn(_i),
-                    warmup=bench_warmup,
-                    rep=bench_rep,
-                    trials=bench_trials,
+                with _Timeout(30):
+                    ref_stats = _do_bench(
+                        lambda _i=_k_inputs: ref_fn(_i),
+                        warmup=bench_warmup,
+                        rep=bench_rep,
+                        trials=bench_trials,
+                        stability_threshold_pct=stability_threshold_pct,
+                    )
+                pair_stats = _summarize_ratio_stats(
+                    [ref_stats["median_ms"] / kernel_stats["median_ms"] if kernel_stats["median_ms"] > 0 else 0.0],
                     stability_threshold_pct=stability_threshold_pct,
+                    timing_source="unpaired.summary",
                 )
 
             kernel_ms = kernel_stats["median_ms"]
@@ -918,7 +1107,8 @@ def run_performance(
                 pct_peak_compute = (throughput_tflops / peak_tflops * 100.0) if peak_tflops > 0 else 0.0
                 pct_peak_bandwidth = (bandwidth_gb_s / gpu.peak_bandwidth_gb_s * 100.0) if gpu.peak_bandwidth_gb_s > 0 else 0.0
 
-            speedup = ref_ms / kernel_ms if kernel_ms > 0 else 0.0
+            speedup = pair_stats["median"] if paired_benchmark else (ref_ms / kernel_ms if kernel_ms > 0 else 0.0)
+            timing_reliable = bool(kernel_stats["stable"] and ref_stats["stable"] and pair_stats["stable"])
 
             entry = {
                 "label": label,
@@ -931,21 +1121,49 @@ def run_performance(
                 "kernel_min_ms": kernel_stats["min_ms"],
                 "kernel_max_ms": kernel_stats["max_ms"],
                 "kernel_std_ms": kernel_stats["std_ms"],
+                "kernel_stderr_ms": kernel_stats["stderr_ms"],
+                "kernel_relative_ci95_pct": kernel_stats["relative_ci95_pct"],
                 "kernel_cv_pct": kernel_stats["cv_pct"],
                 "kernel_timing_spread_pct": kernel_stats["spread_pct"],
                 "kernel_timing_stable": kernel_stats["stable"],
                 "kernel_timing_trials_ms": kernel_stats["trials_ms"],
+                "kernel_trial_count": kernel_stats["trial_count"],
                 "kernel_timing_source": kernel_stats["timing_source"],
                 "reference_average_ms": ref_stats["average_ms"],
                 "reference_median_ms": ref_stats["median_ms"],
                 "reference_min_ms": ref_stats["min_ms"],
                 "reference_max_ms": ref_stats["max_ms"],
                 "reference_std_ms": ref_stats["std_ms"],
+                "reference_stderr_ms": ref_stats["stderr_ms"],
+                "reference_relative_ci95_pct": ref_stats["relative_ci95_pct"],
                 "reference_cv_pct": ref_stats["cv_pct"],
                 "reference_timing_spread_pct": ref_stats["spread_pct"],
                 "reference_timing_stable": ref_stats["stable"],
                 "reference_timing_trials_ms": ref_stats["trials_ms"],
+                "reference_trial_count": ref_stats["trial_count"],
                 "reference_timing_source": ref_stats["timing_source"],
+                "paired_benchmark": paired_benchmark,
+                "paired_speedup_average": pair_stats["average"],
+                "paired_speedup_median": pair_stats["median"],
+                "paired_speedup_trimmed_mean": pair_stats["trimmed_mean"],
+                "paired_speedup_min": pair_stats["min"],
+                "paired_speedup_max": pair_stats["max"],
+                "paired_speedup_std": pair_stats["std"],
+                "paired_speedup_stderr": pair_stats["stderr"],
+                "paired_speedup_relative_ci95_pct": pair_stats["relative_ci95_pct"],
+                "paired_speedup_cv_pct": pair_stats["cv_pct"],
+                "paired_speedup_spread_pct": pair_stats["spread_pct"],
+                "paired_speedup_stable": pair_stats["stable"],
+                "paired_speedup_spread_stable": pair_stats.get("spread_stable", pair_stats["stable"]),
+                "paired_speedup_ci_stable": pair_stats.get("ci_stable", True),
+                "paired_speedup_trials": pair_stats["trials"],
+                "paired_trial_orders": pair_stats.get("trial_orders", []),
+                "adaptive_trials": pair_stats.get("adaptive_trials", False),
+                "min_bench_trials": pair_stats.get("min_trials", bench_trials),
+                "max_bench_trials": pair_stats.get("max_trials", bench_trials),
+                "target_ci_pct": pair_stats.get("target_ci_pct", target_ci_pct),
+                "stopped_by_target_ci": pair_stats.get("stopped_by_target_ci", False),
+                "timing_reliable": timing_reliable,
                 "bench_warmup": bench_warmup,
                 "bench_rep": bench_rep,
                 "bench_trials": bench_trials,
@@ -982,9 +1200,18 @@ def run_performance(
                 f"cv: {ref_stats['cv_pct']:.2f}% | "
                 f"stable: {'yes' if ref_stats['stable'] else 'no'}"
             )
-            if not kernel_stats["stable"]:
+            print(
+                f"    paired speedup trials: [{_format_ms_list(pair_stats['trials'])}] | "
+                f"median: {pair_stats['median']:.4f}x | "
+                f"trimmed_mean: {pair_stats['trimmed_mean']:.4f}x | "
+                f"ci95: {pair_stats['relative_ci95_pct']:.2f}% | "
+                f"spread: {pair_stats['spread_pct']:.2f}% | "
+                f"cv: {pair_stats['cv_pct']:.2f}% | "
+                f"stable: {'yes' if pair_stats['stable'] else 'no'}"
+            )
+            if not timing_reliable:
                 print(
-                    "    WARNING: kernel timing is unstable; treat this benchmark as directional "
+                    "    WARNING: paired timing is unstable; treat this benchmark as directional "
                     "and run full/stable validation before keep/revert."
                 )
 
@@ -1087,11 +1314,19 @@ def main():
     parser.add_argument("--bench-rep", type=int, default=None,
                         help="Measured repetitions per timing trial (default: 100)")
     parser.add_argument("--bench-trials", type=int, default=None,
-                        help="Independent timing trials. Overrides --quick-bench-trials when set")
+                        help="Minimum independent timing trials. Overrides --quick-bench-trials when set")
+    parser.add_argument("--max-bench-trials", type=int, default=None,
+                        help="Maximum adaptive timing trials (default: 9 quick, 31 full)")
+    parser.add_argument("--target-ci-pct", type=float, default=1.0,
+                        help="Stop adaptive paired timing once paired speedup 95%% CI is below this percent (default: 1.0)")
     parser.add_argument("--quick-bench-trials", type=int, default=5,
                         help="Independent timing trials for --quick when --bench-trials is unset (default: 5)")
     parser.add_argument("--stability-threshold-pct", type=float, default=1.5,
                         help="Max trial spread percentage considered timing-stable (default: 1.5)")
+    parser.add_argument("--no-paired-benchmark", action="store_true",
+                        help="Disable adjacent kernel/reference paired timing and use legacy separate timing")
+    parser.add_argument("--no-adaptive-trials", action="store_true",
+                        help="Disable adaptive trial extension; run exactly --bench-trials trials")
     args = parser.parse_args()
     json_out = args.json_out
     bench_warmup = args.bench_warmup if args.bench_warmup is not None else 25
@@ -1101,11 +1336,19 @@ def main():
     elif args.quick:
         bench_trials = args.quick_bench_trials
     else:
-        bench_trials = 3
+        bench_trials = 9
     bench_warmup = max(0, int(bench_warmup))
     bench_rep = max(1, int(bench_rep))
     bench_trials = max(1, int(bench_trials))
+    if args.max_bench_trials is not None:
+        max_bench_trials = max(bench_trials, int(args.max_bench_trials))
+    elif args.quick:
+        max_bench_trials = max(bench_trials, 9)
+    else:
+        max_bench_trials = max(bench_trials, 31)
     stability_threshold_pct = max(0.0, float(args.stability_threshold_pct))
+    target_ci_pct = max(0.0, float(args.target_ci_pct))
+    adaptive_trials = not args.no_adaptive_trials
     benchmark_mode = "quick" if args.quick else "full"
 
     # ------------------------------------------------------------------
@@ -1117,7 +1360,10 @@ def main():
     print(f"benchmark_mode: {benchmark_mode}")
     print(
         f"bench_config: warmup={bench_warmup}, rep={bench_rep}, "
-        f"trials={bench_trials}, stability_threshold_pct={stability_threshold_pct:.2f}"
+        f"trials={bench_trials}, stability_threshold_pct={stability_threshold_pct:.2f}, "
+        f"paired_benchmark={'no' if args.no_paired_benchmark else 'yes'}, "
+        f"adaptive_trials={'yes' if adaptive_trials else 'no'}, "
+        f"max_trials={max_bench_trials}, target_ci_pct={target_ci_pct:.2f}"
     )
 
     if not torch.cuda.is_available():
@@ -1283,6 +1529,10 @@ def main():
             bench_rep=bench_rep,
             bench_trials=bench_trials,
             stability_threshold_pct=stability_threshold_pct,
+            paired_benchmark=not args.no_paired_benchmark,
+            max_bench_trials=max_bench_trials,
+            target_ci_pct=target_ci_pct,
+            adaptive_trials=adaptive_trials,
         )
         peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
     except Exception as e:
@@ -1317,11 +1567,27 @@ def main():
         print(f"kernel_timing_trials_ms: {_format_ms_list(primary['kernel_timing_trials_ms'])}")
         print(f"kernel_timing_spread_pct: {primary['kernel_timing_spread_pct']:.2f}")
         print(f"kernel_timing_cv_pct: {primary['kernel_cv_pct']:.2f}")
+        print(f"kernel_relative_ci95_pct: {primary['kernel_relative_ci95_pct']:.2f}")
         print(f"kernel_timing_stable: {'yes' if primary['kernel_timing_stable'] else 'no'}")
         print(f"reference_timing_trials_ms: {_format_ms_list(primary['reference_timing_trials_ms'])}")
         print(f"reference_timing_spread_pct: {primary['reference_timing_spread_pct']:.2f}")
         print(f"reference_timing_cv_pct: {primary['reference_cv_pct']:.2f}")
+        print(f"reference_relative_ci95_pct: {primary['reference_relative_ci95_pct']:.2f}")
         print(f"reference_timing_stable: {'yes' if primary['reference_timing_stable'] else 'no'}")
+        print(f"paired_speedup_trials: {_format_ms_list(primary['paired_speedup_trials'])}")
+        print(f"paired_speedup_median: {primary['paired_speedup_median']:.4f}x")
+        print(f"paired_speedup_trimmed_mean: {primary['paired_speedup_trimmed_mean']:.4f}x")
+        print(f"paired_speedup_relative_ci95_pct: {primary['paired_speedup_relative_ci95_pct']:.2f}")
+        print(f"paired_speedup_spread_pct: {primary['paired_speedup_spread_pct']:.2f}")
+        print(f"paired_speedup_cv_pct: {primary['paired_speedup_cv_pct']:.2f}")
+        print(f"paired_speedup_stable: {'yes' if primary['paired_speedup_stable'] else 'no'}")
+        print(f"paired_speedup_spread_stable: {'yes' if primary['paired_speedup_spread_stable'] else 'no'}")
+        print(f"paired_speedup_ci_stable: {'yes' if primary['paired_speedup_ci_stable'] else 'no'}")
+        print(f"adaptive_trials: {'yes' if primary['adaptive_trials'] else 'no'}")
+        print(f"actual_bench_trials: {len(primary['paired_speedup_trials'])}")
+        print(f"max_bench_trials: {primary['max_bench_trials']}")
+        print(f"stopped_by_target_ci: {'yes' if primary['stopped_by_target_ci'] else 'no'}")
+        print(f"timing_reliable: {'yes' if primary['timing_reliable'] else 'no'}")
         print(f"peak_vram_mb: {peak_vram_mb:.1f}")
 
         print(f"\n=== COMPARISON VS PYTORCH ===")
@@ -1354,14 +1620,14 @@ def main():
     all_perf = perf_results.get("all", [])
     if len(all_perf) > 1:
         print(f"\n=== SIZE SWEEP ===")
-        print(f"{'size':<12} {'kernel_us':>12} {'pytorch_us':>12} {'speedup':>10} {'tflops':>10} {'%peak':>8} {'spread%':>8} {'stable':>8}")
-        print("-" * 84)
+        print(f"{'size':<12} {'kernel_us':>12} {'pytorch_us':>12} {'speedup':>10} {'tflops':>10} {'%peak':>8} {'spread%':>8} {'reliable':>9}")
+        print("-" * 86)
         for entry in all_perf:
             print(f"{entry['label']:<12} {entry['kernel_latency_us']:>12.2f} "
                   f"{entry['pytorch_latency_us']:>12.2f} {entry['speedup_vs_pytorch']:>9.3f}x "
                   f"{entry['throughput_tflops']:>10.3f} {entry['pct_peak_compute']:>7.1f}% "
                   f"{entry['kernel_timing_spread_pct']:>7.2f}% "
-                  f"{'yes' if entry['kernel_timing_stable'] else 'no':>8}")
+                  f"{'yes' if entry['timing_reliable'] else 'no':>9}")
 
     # ------------------------------------------------------------------
     # Profiling (optional)
@@ -1390,8 +1656,26 @@ def main():
         print(f"bottleneck: {primary['bottleneck']}")
         print(f"kernel_timing_spread_pct: {primary['kernel_timing_spread_pct']:.2f}")
         print(f"kernel_timing_cv_pct: {primary['kernel_cv_pct']:.2f}")
+        print(f"kernel_relative_ci95_pct: {primary['kernel_relative_ci95_pct']:.2f}")
         print(f"kernel_timing_stable: {'yes' if primary['kernel_timing_stable'] else 'no'}")
-        if benchmark_mode == "quick" and not primary["kernel_timing_stable"]:
+        print(f"reference_timing_spread_pct: {primary['reference_timing_spread_pct']:.2f}")
+        print(f"reference_timing_cv_pct: {primary['reference_cv_pct']:.2f}")
+        print(f"reference_relative_ci95_pct: {primary['reference_relative_ci95_pct']:.2f}")
+        print(f"reference_timing_stable: {'yes' if primary['reference_timing_stable'] else 'no'}")
+        print(f"paired_speedup_median: {primary['paired_speedup_median']:.4f}x")
+        print(f"paired_speedup_trimmed_mean: {primary['paired_speedup_trimmed_mean']:.4f}x")
+        print(f"paired_speedup_relative_ci95_pct: {primary['paired_speedup_relative_ci95_pct']:.2f}")
+        print(f"paired_speedup_spread_pct: {primary['paired_speedup_spread_pct']:.2f}")
+        print(f"paired_speedup_cv_pct: {primary['paired_speedup_cv_pct']:.2f}")
+        print(f"paired_speedup_stable: {'yes' if primary['paired_speedup_stable'] else 'no'}")
+        print(f"paired_speedup_spread_stable: {'yes' if primary['paired_speedup_spread_stable'] else 'no'}")
+        print(f"paired_speedup_ci_stable: {'yes' if primary['paired_speedup_ci_stable'] else 'no'}")
+        print(f"adaptive_trials: {'yes' if primary['adaptive_trials'] else 'no'}")
+        print(f"actual_bench_trials: {len(primary['paired_speedup_trials'])}")
+        print(f"max_bench_trials: {primary['max_bench_trials']}")
+        print(f"stopped_by_target_ci: {'yes' if primary['stopped_by_target_ci'] else 'no'}")
+        print(f"timing_reliable: {'yes' if primary['timing_reliable'] else 'no'}")
+        if benchmark_mode == "quick" and not primary["timing_reliable"]:
             print("WARNING: quick benchmark timing is unstable; run full benchmark before keep/revert.")
         print(f"tensor_core_recommendation: {benchmark_compute_traits['tensor_core_recommendation']}")
         print(f"tensor_core_reasoning: {benchmark_compute_traits['tensor_core_reasoning']}")
@@ -1412,7 +1696,11 @@ def main():
             "warmup": bench_warmup,
             "rep": bench_rep,
             "trials": bench_trials,
+            "max_trials": max_bench_trials,
             "stability_threshold_pct": stability_threshold_pct,
+            "paired_benchmark": not args.no_paired_benchmark,
+            "adaptive_trials": adaptive_trials,
+            "target_ci_pct": target_ci_pct,
         },
         "gpu_name": gpu.name,
         "gpu_compute_capability": f"{gpu.compute_capability[0]}.{gpu.compute_capability[1]}",
@@ -1437,11 +1725,13 @@ def main():
             "min_ms": float(primary["kernel_min_ms"]) if primary else 0.0,
             "max_ms": float(primary["kernel_max_ms"]) if primary else 0.0,
             "std_ms": float(primary["kernel_std_ms"]) if primary else 0.0,
+            "stderr_ms": float(primary["kernel_stderr_ms"]) if primary else 0.0,
+            "relative_ci95_pct": float(primary["kernel_relative_ci95_pct"]) if primary else 0.0,
             "cv_pct": float(primary["kernel_cv_pct"]) if primary else 0.0,
             "spread_pct": float(primary["kernel_timing_spread_pct"]) if primary else 0.0,
             "stable": bool(primary["kernel_timing_stable"]) if primary else False,
             "trials_ms": [float(v) for v in primary["kernel_timing_trials_ms"]] if primary else [],
-            "trial_count": int(primary["bench_trials"]) if primary else 0,
+            "trial_count": int(primary["kernel_trial_count"]) if primary else 0,
             "warmup": int(primary["bench_warmup"]) if primary else bench_warmup,
             "rep": int(primary["bench_rep"]) if primary else bench_rep,
             "timing_source": primary["kernel_timing_source"] if primary else "",
@@ -1452,16 +1742,42 @@ def main():
             "min_ms": float(primary["reference_min_ms"]) if primary else 0.0,
             "max_ms": float(primary["reference_max_ms"]) if primary else 0.0,
             "std_ms": float(primary["reference_std_ms"]) if primary else 0.0,
+            "stderr_ms": float(primary["reference_stderr_ms"]) if primary else 0.0,
+            "relative_ci95_pct": float(primary["reference_relative_ci95_pct"]) if primary else 0.0,
             "cv_pct": float(primary["reference_cv_pct"]) if primary else 0.0,
             "spread_pct": float(primary["reference_timing_spread_pct"]) if primary else 0.0,
             "stable": bool(primary["reference_timing_stable"]) if primary else False,
             "trials_ms": [float(v) for v in primary["reference_timing_trials_ms"]] if primary else [],
-            "trial_count": int(primary["bench_trials"]) if primary else 0,
+            "trial_count": int(primary["reference_trial_count"]) if primary else 0,
             "warmup": int(primary["bench_warmup"]) if primary else bench_warmup,
             "rep": int(primary["bench_rep"]) if primary else bench_rep,
             "timing_source": primary["reference_timing_source"] if primary else "",
         },
-        "timing_stable": bool(primary["kernel_timing_stable"]) if primary else False,
+        "paired_speedup": {
+            "average": float(primary["paired_speedup_average"]) if primary else 0.0,
+            "median": float(primary["paired_speedup_median"]) if primary else 0.0,
+            "trimmed_mean": float(primary["paired_speedup_trimmed_mean"]) if primary else 0.0,
+            "min": float(primary["paired_speedup_min"]) if primary else 0.0,
+            "max": float(primary["paired_speedup_max"]) if primary else 0.0,
+            "std": float(primary["paired_speedup_std"]) if primary else 0.0,
+            "stderr": float(primary["paired_speedup_stderr"]) if primary else 0.0,
+            "relative_ci95_pct": float(primary["paired_speedup_relative_ci95_pct"]) if primary else 0.0,
+            "cv_pct": float(primary["paired_speedup_cv_pct"]) if primary else 0.0,
+            "spread_pct": float(primary["paired_speedup_spread_pct"]) if primary else 0.0,
+            "stable": bool(primary["paired_speedup_stable"]) if primary else False,
+            "spread_stable": bool(primary["paired_speedup_spread_stable"]) if primary else False,
+            "ci_stable": bool(primary["paired_speedup_ci_stable"]) if primary else False,
+            "trials": [float(v) for v in primary["paired_speedup_trials"]] if primary else [],
+            "trial_orders": [str(v) for v in primary["paired_trial_orders"]] if primary else [],
+            "trial_count": len(primary["paired_speedup_trials"]) if primary else 0,
+            "actual_trial_count": len(primary["paired_speedup_trials"]) if primary else 0,
+            "min_trials": int(primary["min_bench_trials"]) if primary else bench_trials,
+            "max_trials": int(primary["max_bench_trials"]) if primary else max_bench_trials,
+            "target_ci_pct": float(primary["target_ci_pct"]) if primary else target_ci_pct,
+            "adaptive_trials": bool(primary["adaptive_trials"]) if primary else adaptive_trials,
+            "stopped_by_target_ci": bool(primary["stopped_by_target_ci"]) if primary else False,
+        },
+        "timing_stable": bool(primary["timing_reliable"]) if primary else False,
         "timing_spread_pct": float(primary["kernel_timing_spread_pct"]) if primary else 0.0,
         "speedup_vs_pytorch": float(primary["speedup_vs_pytorch"]) if primary else 0.0,
         "throughput_tflops": float(throughput),

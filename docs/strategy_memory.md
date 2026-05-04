@@ -83,8 +83,13 @@ default. A non-route experiment must pass `--allow-local-after-boundary` and
 must explain why it is still justified.
 
 For each architecture route, record:
+- route type: `architecture_discovery` for route selection or
+  `architecture_route` for implementation
 - route invariant: the old dataflow or intermediate that must disappear
 - expected payoff: dynamic-time coverage and best-case speedup range
+- milestone: skeleton, precompute kernel, consumer kernel, end-to-end
+  correctness, stage benchmark, resource rebalance, or validation
+- milestone status: pending, passed, or failed
 - prototype-ladder stage: the current stage, the next missing high-upside
   stage, and why local cleanup is premature or allowed
 - promotion gate: the evidence required to move from route exploration back to
@@ -95,6 +100,8 @@ For each architecture route, record:
   untenable, or a full/stable benchmark proves the route is below threshold
 - route plan: a route portfolio containing at least two structurally distinct
   candidates before starting a new route under an active design-boundary marker
+- negative evidence scope: what implementation family is blocked, what broader
+  route remains unblocked, and whether the old bottleneck was actually removed
 
 Do not abandon a high-upside route after the first failure if that failure is a
 race, missing synchronization, register imbalance, or incomplete removal of the
