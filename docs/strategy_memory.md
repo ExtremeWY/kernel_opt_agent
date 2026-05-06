@@ -83,8 +83,13 @@ default. A non-route experiment must pass `--allow-local-after-boundary` and
 must explain why it is still justified.
 
 For each architecture route, record:
+- route type: `architecture_discovery` for route selection or
+  `architecture_route` for implementation
 - route invariant: the old dataflow or intermediate that must disappear
 - expected payoff: dynamic-time coverage and best-case speedup range
+- milestone: skeleton, precompute kernel, consumer kernel, end-to-end
+  correctness, stage benchmark, resource rebalance, or validation
+- milestone status: pending, passed, or failed
 - prototype-ladder stage: the current stage, the next missing high-upside
   stage, and why local cleanup is premature or allowed
 - promotion gate: the evidence required to move from route exploration back to
@@ -95,6 +100,8 @@ For each architecture route, record:
   untenable, or a full/stable benchmark proves the route is below threshold
 - route plan: a route portfolio containing at least two structurally distinct
   candidates before starting a new route under an active design-boundary marker
+- negative evidence scope: what implementation family is blocked, what broader
+  route remains unblocked, and whether the old bottleneck was actually removed
 
 Do not abandon a high-upside route after the first failure if that failure is a
 race, missing synchronization, register imbalance, or incomplete removal of the
@@ -133,6 +140,10 @@ Negative evidence must be scoped to the satisfied stage. For example:
 
 - a layout-padding failure blocks that padding neighborhood, not all layout
   swizzles
+- a direct swizzle failure under a fixed-layout WMMA consumer blocks that
+  incompatible loader/layout pairing, not a route that also changes the consumer
+  to manual `ldmatrix`/`mma.sync`, manual fragments, or an explicit descriptor
+  layout
 - a slower first pipeline blocks that stage-count/resource combination, not all
   overlap routes
 - a primitive graft that leaves the old hot-state materialization in place does

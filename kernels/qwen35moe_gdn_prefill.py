@@ -1,4 +1,4 @@
-"""Qwen3.5 MoE GDN chunked BF16 Tensor Core prefill wrapper."""
+"""Qwen3.5 MoE GDN prefill FP32 scalar CUDA reference wrapper."""
 
 from __future__ import annotations
 
@@ -20,19 +20,12 @@ H_V = 32
 
 def _extension_name(source_path: Path) -> str:
     digest = hashlib.sha256(source_path.read_bytes()).hexdigest()[:12]
-    return f"qwen35moe_gdn_prefill_bf16tc_cuda_{digest}"
-
-
-def _repo_root_for(source_path: Path) -> Path:
-    for parent in (source_path.parent, *source_path.parents):
-        if (parent / "program.md").is_file():
-            return parent
-    return source_path.parent
+    return f"qwen35moe_gdn_prefill_ref_cuda_{digest}"
 
 
 def _build_extension() -> object:
-    source_path = Path(__file__).resolve().with_suffix(".cu")
-    build_root = _repo_root_for(source_path) / "workspace" / ".torch_extensions"
+    source_path = Path(__file__).with_suffix(".cu")
+    build_root = source_path.parents[1] / "workspace" / ".torch_extensions"
     build_root.mkdir(parents=True, exist_ok=True)
     name = _extension_name(source_path)
     build_dir = build_root / name
@@ -63,9 +56,6 @@ def _build_extension() -> object:
                                     "-std=c++17",
                                     "--expt-relaxed-constexpr",
                                     "--expt-extended-lambda",
-                                    "-U__CUDA_NO_HALF_OPERATORS__",
-                                    "-U__CUDA_NO_HALF_CONVERSIONS__",
-                                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                                     "-gencode=arch=compute_89,code=sm_89",
                                 ],
                             }},
@@ -158,13 +148,30 @@ def kernel_fn(
     q, k, v, g, beta, state = _validate(q, k, v, g, beta, state)
     if scale is None:
         scale = D ** -0.5
-    return _load_extension().qwen35moe_gdn_prefill_bf16tc(q, k, v, g, beta, state, float(scale))
+    return _load_extension().qwen35moe_gdn_prefill_ref(q, k, v, g, beta, state, float(scale))
 
 
 def get_inputs(batch: int = 1, seq_len: int = 4096, dtype: torch.dtype = torch.float32, seed: int = 42) -> dict:
-    from kernels.qwen35moe_gdn_prefill import get_inputs as _get_inputs
+    del seed
+    device = "cuda"
 
-    return _get_inputs(batch=batch, seq_len=seq_len, dtype=dtype, seed=seed)
+    def filled(shape: tuple[int, ...], scale: float, bias: float) -> torch.Tensor:
+        n = 1
+        for dim in shape:
+            n *= dim
+        x = torch.arange(n, device=device, dtype=torch.float32)
+        x = ((x % 251) - 125.0) * scale + bias
+        return x.reshape(shape).to(dtype)
+
+    return {
+        "q": filled((batch, seq_len, H_K, D), 0.001, 0.0),
+        "k": filled((batch, seq_len, H_K, D), 0.001, 0.0),
+        "v": filled((batch, seq_len, H_V, D), 0.001, 0.0),
+        "g": filled((batch, seq_len, H_V), 0.0001, -0.01),
+        "beta": filled((batch, seq_len, H_V), 0.0001, 0.5),
+        "state": filled((batch, H_V, D, D), 0.0001, 0.0),
+        "scale": D ** -0.5,
+    }
 
 
 def get_flops(batch: int = 1, seq_len: int = 4096) -> int:

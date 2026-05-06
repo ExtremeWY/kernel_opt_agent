@@ -89,6 +89,8 @@ For quick iteration (skip numerical stability, determinism, edge cases):
 
 Quick mode is directional evidence only. It benchmarks fewer cases but still emits multi-trial timing stability fields. If timing is unstable, or if the measured improvement/regression is close to the benchmark noise band, run the full benchmark before making a keep/revert decision.
 
+When comparing two custom-kernel CUDA candidates, a saved benchmark JSON is historical evidence only. If the candidate is manually produced outside the main iteration harness, if per-shape results are mixed, or if the delta is within the configured timing stability/noise band, run a same-process paired A/B benchmark against the current best before promotion. Build both CUDA sources in the same Python process, reuse one input set per shape, alternate measurement order per trial, and record candidate/current-best medians, paired ratios, CI, spread, trial count, source paths, and source hashes. Do not promote a CUDA candidate from stale cross-process timing alone.
+
 Read `run.log` and extract the key metrics:
 
 ```bash
@@ -116,11 +118,14 @@ Analyze the benchmark results to understand the kernel's **macro-level** perform
 
 This gives you the **direction** of optimization (memory vs. compute), but not the **specific** cause.
 
-### Step 2b: Performance Model When No Strong Reference Exists
+### Step 2b: Oracle-Free Architecture Discovery
 
-A fast black-box reference profile is optional, not a requirement. If there is
-no trusted high-performance implementation to compare against, build a
-first-principles performance model before choosing experiments:
+A fast black-box reference profile is optional, not a requirement. Architecture
+routes must be selectable without FlashQLA, Triton, TileLang, CUTLASS, or any
+other external implementation acting as an oracle. If a trusted external probe
+exists, record it as optional evidence only; never make it a prerequisite for
+route selection or keep/reject decisions. Build a first-principles performance
+model before choosing structural experiments:
 
 1. **Operator contract**: record which dimensions, dtypes, layouts, and semantic
    flags are true API or production invariants, and which are runtime-variable.
@@ -142,6 +147,12 @@ first-principles performance model before choosing experiments:
    residency, hardware primitive, layout, pipeline, grid scheduling, then local
    cleanup. If a higher-upside earlier stage is missing, test that architecture
    route before spending iterations on later-stage micro-tuning.
+7. **Dependency graph**: record each important intermediate by its dependencies
+   and ownership axes. For repeated work, identify whether the route removes the
+   repeated work or only caches a partial raw intermediate.
+8. **Stage model**: estimate producer, consumer, added memory traffic, launch
+   count, and total runtime separately. Structural route early milestones use
+   these stage metrics before full benchmark validation.
 
 The model is allowed to be approximate, but it must be explicit enough to reject
 low-coverage ideas before implementation.
@@ -222,6 +233,23 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 15. **No-reference route gate**: when there is no high-performance reference, route selection must be justified by the performance model and current-kernel NCU/source attribution. The proposal must name the structural cost to remove, the affected dynamic-work fraction, the primitive ceiling being targeted, and why the route is not a benchmark-shape specialization.
 16. **Prototype-ladder gate**: before proposing local cleanup, record the current prototype-ladder stage and the next missing high-upside stage from `docs/prototype_ladder.md`. If the next missing stage targets the dominant steady-state work and has plausible multi-percent payoff, it must become an architecture route instead of a local experiment.
 17. **Stage-promotion gate**: a route can only be considered rejected after a correctness-passing, resource-balanced implementation actually satisfies its route invariant. Failed partial grafts, implementations that still carry the old hot intermediate, or first versions with repairable synchronization/resource issues are narrow negative evidence or route sub-iterations, not proof that the broader stage is invalid.
+18. **Route-type gate**: execute local tuning, architecture discovery,
+    architecture routes, optional external probes, and framework maintenance as
+    separate modes. Do not apply local-tune immediate speed gates to structural
+    milestones before validation.
+19. **Stage-metrics gate**: multi-stage routes must record producer, consumer,
+    added memory traffic, launch count, and total timing when they reach the
+    `stage_benchmark` milestone. End-to-end timing alone is not enough to reject
+    an earlier structural milestone.
+20. **Layout/primitive compatibility gate**: for shared-memory bank-conflict or
+    swizzle work, identify the consumer primitive before editing. Standard
+    WMMA/CUTE/CUTLASS/TMA/ldmatrix paths each impose a concrete operand layout.
+    A swizzled shared layout is valid only when the consumer address path is
+    changed to match it, e.g. hand-written `ldmatrix`/`mma.sync`, manual
+    fragment construction, or a descriptor/layout API that explicitly encodes
+    the swizzle. If the consumer remains `wmma::load_matrix_sync` or another
+    standard row/column-major loader, use compatible fixes such as padding or
+    leading-dimension changes instead of XOR-swizzling the stored matrix.
 
 **Rules:**
 - One change per experiment. Do not combine unrelated optimizations.
@@ -233,8 +261,18 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 - For boundary-only changes (tail cases, partial tiles, uncommon predicates, rare dtype/shape paths), compute what fraction of the benchmarked dynamic work they cover. If that fraction is small, deprioritize them behind changes that affect the steady-state hot path.
 - Runtime checks for common tile states are allowed when they preserve correctness and performance portability across all supported sizes. Benchmark-only dispatch is not allowed.
 - Do not turn a structural bottleneck into a series of local layout/load/barrier tweaks. If NCU and history indicate the design itself is wrong, the next experiments must change the design boundary.
+- Do not apply generic swizzle indexing to shared matrices consumed by standard
+  WMMA or another fixed-layout primitive. The proposal must state whether the
+  primitive consumes the original layout or a manually controlled swizzled
+  address stream. Validate this class of change with both correctness and NCU
+  before/after shared bank-conflict counters; if bank conflicts fall but runtime
+  is within timing noise, record the metric win as route evidence rather than
+  over-claiming a keepable end-to-end speedup.
 - When pursuing a design-boundary route, keep the route invariant explicit. Examples of route invariants include “remove a materialized intermediate from the hot path,” “change the ownership model so the producer consumes its own result,” or “move the dominant work to the intended hardware pipeline.” Sub-iterations may tune tile shape, resource balance, or synchronization only if they preserve that invariant.
 - Do not classify an architecture route as failed because one intermediate implementation regressed while it still carried the old bottleneck. Record whether the tested version truly removed the dominant intermediate or only partially bypassed it.
+- Do not require an external implementation as a structural oracle. External
+  probes are optional evidence; dependency graphs, duplicate-work analysis, and
+  stage cost models are the required basis for route discovery.
 - If a local family has produced several sub-threshold wins while the reference gap remains large, stop the family even if each individual change is plausible. A chain of small wins can still lead to a hard design ceiling.
 - Do not keep optimizing a low-ceiling prototype just because it is the nearest
   editable code. If the operator model points to a different ownership,
@@ -280,6 +318,8 @@ git commit -m "experiment: <brief description of change>"
 | correctness = PASS, full/stable benchmark throughput same or worse | **REVERT**: `git reset --hard HEAD~1` |
 
 If `--quick` and full benchmark disagree, use the full benchmark result. If the delta is within the configured timing stability threshold, treat the experiment as inconclusive and prefer another hypothesis instead of tuning around noise.
+
+For manual CUDA candidates, a full benchmark against the reference does not replace a current-best A/B comparison. If a manually created `.cu` file is being considered for promotion and the margin is near the noise band, run same-process paired benchmarking against the active best across the relevant shapes before the keep/reject decision.
 
 Architecture-route exception:
 
@@ -563,13 +603,21 @@ For faster iteration, use `tools/run_loop.py` to automate Steps 6-9 (commit, ben
 # Structural route mode:
 .venv/bin/python tools/run_loop.py \
   --hypothesis "prototype new mainloop ownership" \
-  --architecture-route \
+  --iteration-mode architecture_route \
   --route-invariant "remove the dominant steady-state handoff" \
   --route-expected-impact "mainloop coverage high; target >5% end-to-end" \
   --route-budget 8 \
+  --route-milestone skeleton \
   --route-iteration-role prototype \
+  --route-allow-regression \
   --targeted-ncu
 ```
+
+Use `workspace/architecture_route_plan_template.md` as the route-plan template.
+The runner also accepts JSON route plans with the same fields. The plan is
+oracle-free by default: it requires an operator dependency graph,
+duplicate-work/materialization model, and stage cost model before listing route
+candidates.
 
 The runner automatically:
 - Commits `kernel.py` (and `kernel.cu` if present) before benchmarking

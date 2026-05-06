@@ -73,7 +73,27 @@ REQUIRED_MARKDOWN_ROUTE_PLAN_TERMS = {
     "next_missing_stage": ("next_missing_high_upside_stage", "next missing"),
     "promotion_gate": ("promotion_gate", "promotion gate"),
     "negative_evidence_scope": ("negative_evidence_scope", "negative evidence"),
+    "operator_dependency_graph": ("operator_dependency_graph", "dependency graph"),
+    "duplicate_work_model": ("duplicate_work_or_materialization_model", "duplicate work", "materialization model"),
+    "stage_cost_model": ("stage_cost_model", "stage cost"),
 }
+ITERATION_MODES = (
+    "local_tune",
+    "architecture_discovery",
+    "architecture_route",
+    "external_probe",
+    "framework_maintenance",
+)
+ROUTE_MILESTONES = (
+    "skeleton",
+    "precompute_kernel",
+    "consumer_kernel",
+    "end_to_end_correctness",
+    "stage_benchmark",
+    "resource_rebalance",
+    "validation",
+)
+ROUTE_MILESTONE_STATUSES = ("pending", "passed", "failed")
 
 
 def now_stamp() -> str:
@@ -118,6 +138,10 @@ def _validate_route_metadata(route_metadata: dict[str, Any]) -> list[str]:
         return []
 
     errors: list[str] = []
+    route_type = str(route_metadata.get("route_type") or "")
+    if route_type not in ("architecture_discovery", "architecture_route"):
+        errors.append("route_type_must_be_architecture_discovery_or_architecture_route")
+
     required_fields = {
         "route_invariant": str(route_metadata.get("invariant") or ""),
         "route_expected_impact": str(route_metadata.get("expected_impact") or ""),
@@ -133,8 +157,32 @@ def _validate_route_metadata(route_metadata: dict[str, Any]) -> list[str]:
 
     if route_metadata.get("iteration_role") == "validation" and route_metadata.get("allow_regression"):
         errors.append("validation_cannot_allow_regression")
+    if route_metadata.get("milestone") == "validation" and route_metadata.get("allow_regression"):
+        errors.append("validation_milestone_cannot_allow_regression")
+    if route_metadata.get("milestone") not in ROUTE_MILESTONES:
+        errors.append("route_milestone_invalid")
+    if route_metadata.get("milestone_status") not in ROUTE_MILESTONE_STATUSES:
+        errors.append("route_milestone_status_invalid")
+    if route_metadata.get("milestone") == "validation" and route_metadata.get("invariant_satisfied") is False:
+        errors.append("validation_requires_invariant_satisfied")
 
     return errors
+
+
+def _parse_csv_tokens(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _parse_json_object(value: str, *, label: str) -> dict[str, Any]:
+    if not value.strip():
+        return {}
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label}_invalid_json:{exc.msg}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label}_must_be_json_object")
+    return payload
 
 
 def _normalize_markdown_field(label: str) -> str:
@@ -188,6 +236,17 @@ def _validate_route_plan(route_plan_path: str | None, min_routes: int = 2) -> tu
             if _is_placeholder_text(str(ladder.get(field) or "")):
                 return False, f"prototype_ladder_{field}_required"
 
+        model = payload.get("oracle_free_model") or payload.get("architecture_discovery") or {}
+        if not isinstance(model, dict):
+            return False, "oracle_free_model_not_object"
+        for field in (
+            "operator_dependency_graph",
+            "duplicate_work_or_materialization_model",
+            "stage_cost_model",
+        ):
+            if _is_placeholder_text(str(model.get(field) or "")):
+                return False, f"oracle_free_model_{field}_required"
+
         routes = payload.get("routes")
         if isinstance(routes, list):
             route_count = len(routes)
@@ -213,6 +272,13 @@ def _validate_route_plan(route_plan_path: str | None, min_routes: int = 2) -> tu
             if not any(alias in lowered for alias in aliases):
                 return False, f"route_plan_missing_{name}"
         for field in ("current_stage", "next_missing_high_upside_stage", "evidence_needed_before_local_tuning_resumes"):
+            if _count_filled_markdown_field(text, field) < 1:
+                return False, f"route_plan_{field}_required"
+        for field in (
+            "operator_dependency_graph",
+            "duplicate_work_or_materialization_model",
+            "stage_cost_model",
+        ):
             if _count_filled_markdown_field(text, field) < 1:
                 return False, f"route_plan_{field}_required"
         for field in (
@@ -310,6 +376,15 @@ def _run_bench_to_artifacts(
     quick: bool,
     gpu: int,
     artifact_prefix: str = "benchmark",
+    bench_warmup: int | None = None,
+    bench_rep: int | None = None,
+    bench_trials: int | None = None,
+    max_bench_trials: int | None = None,
+    quick_bench_trials: int | None = None,
+    stability_threshold_pct: float | None = None,
+    target_ci_pct: float | None = None,
+    adaptive_trials: bool = True,
+    paired_benchmark: bool = True,
 ) -> tuple[int, dict[str, Any], str]:
     benchmark_json = iter_dir / f"{artifact_prefix}_result.json"
     stdout_path = iter_dir / f"{artifact_prefix}.stdout.txt"
@@ -323,6 +398,24 @@ def _run_bench_to_artifacts(
     )
     if quick:
         cmd.append("--quick")
+    if bench_warmup is not None:
+        cmd.extend(["--bench-warmup", str(bench_warmup)])
+    if bench_rep is not None:
+        cmd.extend(["--bench-rep", str(bench_rep)])
+    if bench_trials is not None:
+        cmd.extend(["--bench-trials", str(bench_trials)])
+    if max_bench_trials is not None:
+        cmd.extend(["--max-bench-trials", str(max_bench_trials)])
+    if quick_bench_trials is not None:
+        cmd.extend(["--quick-bench-trials", str(quick_bench_trials)])
+    if stability_threshold_pct is not None:
+        cmd.extend(["--stability-threshold-pct", str(stability_threshold_pct)])
+    if target_ci_pct is not None:
+        cmd.extend(["--target-ci-pct", str(target_ci_pct)])
+    if not adaptive_trials:
+        cmd.append("--no-adaptive-trials")
+    if not paired_benchmark:
+        cmd.append("--no-paired-benchmark")
     result = _run(cmd, timeout=900)
     _write_text(stdout_path, result.stdout or "")
     _write_text(stderr_path, result.stderr or "")
@@ -419,26 +512,39 @@ def _write_proposal_stub(
     if route_metadata and route_metadata.get("enabled"):
         content += (
             "\n## Architecture Route\n"
+            f"- route_type: {route_metadata.get('route_type', '')}\n"
             f"- route_id: {route_metadata.get('route_id', '')}\n"
             f"- invariant: {route_metadata.get('invariant', '')}\n"
             f"- expected_impact: {route_metadata.get('expected_impact', '')}\n"
             f"- budget: {route_metadata.get('budget', 0)}\n"
+            f"- milestone: {route_metadata.get('milestone', '')}\n"
+            f"- milestone_status: {route_metadata.get('milestone_status', '')}\n"
             f"- iteration_role: {route_metadata.get('iteration_role', '')}\n"
             f"- allow_regression: {route_metadata.get('allow_regression', False)}\n"
             f"- stop_condition: {route_metadata.get('stop_condition', '')}\n"
             f"- route_plan: {route_metadata.get('route_plan', '') or 'none'}\n"
+            f"- invariant_satisfied: {route_metadata.get('invariant_satisfied')}\n"
+            f"- old_bottleneck_removed: {route_metadata.get('old_bottleneck_removed')}\n"
+            f"- stage_metrics: {json.dumps(route_metadata.get('stage_metrics') or {}, ensure_ascii=False)}\n"
+            f"- negative_evidence_scope: {route_metadata.get('negative_evidence_scope', '') or 'none'}\n"
+            f"- failure_class: {route_metadata.get('failure_class', '') or 'none'}\n"
+            f"- blocks: {', '.join(route_metadata.get('blocks') or []) or 'none'}\n"
+            f"- does_not_block: {', '.join(route_metadata.get('does_not_block') or []) or 'none'}\n"
             "\n## Prototype Ladder\n"
             "- current_stage: fill_me\n"
             "- next_missing_high_upside_stage: fill_me\n"
             "- why_local_micro_tuning_is_premature_or_allowed: fill_me\n"
             "- promotion_gate: fill_me\n"
             "- negative_evidence_scope_if_failed: fill_me\n"
-            "\n## No Strong Reference Triage\n"
+            "\n## Oracle-Free Structural Triage\n"
+            "- operator_dependency_graph: fill_me\n"
+            "- duplicate_work_or_materialization_model: fill_me\n"
             "- performance_model_upper_bound: fill_me\n"
             "- affected_dynamic_work_fraction: fill_me\n"
             "- current_self_profile_bottleneck: fill_me\n"
             "- structural_cost_to_remove: fill_me\n"
             "- why_this_is_not_a_local_micro_tweak: fill_me\n"
+            "- external_probe_used: no\n"
         )
     _write_text(proposal_path, content)
     return proposal_path
@@ -481,6 +587,47 @@ def _get_parent_throughput(parent_id: str) -> float:
     return 0.0
 
 
+def _stats_unstable_reason(label: str, stats: dict[str, Any]) -> str:
+    if not stats:
+        return ""
+    if stats.get("stable") is False:
+        spread = float(stats.get("spread_pct", 0.0) or 0.0)
+        cv = float(stats.get("cv_pct", 0.0) or 0.0)
+        ci95 = float(stats.get("relative_ci95_pct", 0.0) or 0.0)
+        return f"{label}_timing_unstable_spread_{spread:.2f}_cv_{cv:.2f}_ci95_{ci95:.2f}_percent"
+    return ""
+
+
+def _timing_unstable_reason(bench: dict[str, Any]) -> str:
+    for label, stats in (
+        ("kernel", bench.get("kernel") or {}),
+        ("reference", bench.get("reference") or {}),
+        ("paired_speedup", bench.get("paired_speedup") or {}),
+    ):
+        reason = _stats_unstable_reason(label, stats)
+        if reason:
+            return reason
+    if bench.get("timing_stable") is False:
+        spread = float(bench.get("timing_spread_pct", 0.0) or 0.0)
+        return f"timing_unstable_spread_{spread:.2f}_percent"
+    return ""
+
+
+def _timing_uncertainty_pct(bench: dict[str, Any]) -> float:
+    bench_config = bench.get("bench_config") or {}
+    threshold = float(bench_config.get("stability_threshold_pct", 1.5) or 1.5)
+    values = [1.0, threshold]
+    for stats in (
+        bench.get("kernel") or {},
+        bench.get("reference") or {},
+        bench.get("paired_speedup") or {},
+    ):
+        values.append(float(stats.get("spread_pct", 0.0) or 0.0))
+        values.append(float(stats.get("cv_pct", 0.0) or 0.0))
+        values.append(float(stats.get("relative_ci95_pct", 0.0) or 0.0))
+    return max(values)
+
+
 def _append_result(record: dict[str, Any]) -> None:
     bench = record.get("benchmark_result") or {}
     correctness = bench.get("correctness") or {}
@@ -521,10 +668,9 @@ def _quick_benchmark_requires_full_validation(bench: dict[str, Any], parent_id: 
     if correctness.get("passed") is not True:
         return False, ""
 
-    kernel = bench.get("kernel") or {}
-    if kernel.get("stable") is False:
-        spread = float(kernel.get("spread_pct", 0.0) or 0.0)
-        return True, f"quick_timing_unstable_spread_{spread:.2f}_percent"
+    unstable_reason = _timing_unstable_reason(bench)
+    if unstable_reason:
+        return True, f"quick_{unstable_reason}"
 
     parent_tp = _get_parent_throughput(parent_id)
     current_tp = float(bench.get("throughput_tflops", 0.0) or 0.0)
@@ -532,11 +678,7 @@ def _quick_benchmark_requires_full_validation(bench: dict[str, Any], parent_id: 
         return False, ""
 
     improvement = (current_tp - parent_tp) / parent_tp * 100.0
-    bench_config = bench.get("bench_config") or {}
-    threshold = float(bench_config.get("stability_threshold_pct", 1.5) or 1.5)
-    spread_pct = float(kernel.get("spread_pct", 0.0) or 0.0)
-    cv_pct = float(kernel.get("cv_pct", 0.0) or 0.0)
-    uncertainty_pct = max(1.0, threshold, spread_pct, cv_pct)
+    uncertainty_pct = _timing_uncertainty_pct(bench)
 
     if -uncertainty_pct <= improvement <= 1.0 + uncertainty_pct:
         return True, f"quick_improvement_{improvement:.2f}_within_uncertainty_{uncertainty_pct:.2f}_percent"
@@ -546,27 +688,40 @@ def _quick_benchmark_requires_full_validation(bench: dict[str, Any], parent_id: 
 def _decide_keep(record: dict[str, Any], parent_id: str) -> tuple[bool, str]:
     bench = record.get("benchmark_result") or {}
     correctness = bench.get("correctness") or {}
+    iteration_mode = str(record.get("iteration_mode") or "local_tune")
+    if iteration_mode == "external_probe":
+        return False, "external_probe_evidence_only_not_optimized_solution"
+    if iteration_mode == "framework_maintenance":
+        return False, "framework_maintenance_not_kernel_speedup"
     route = record.get("architecture_route") or {}
     route_mode = bool(route.get("enabled"))
     route_allow_regression = bool(route.get("allow_regression"))
     route_role = str(route.get("iteration_role") or "")
+    route_milestone = str(route.get("milestone") or "")
+    route_milestone_status = str(route.get("milestone_status") or "")
+    route_validation = route_role == "validation" or route_milestone == "validation"
     if not correctness.get("passed"):
         return False, "correctness_failed"
     peak_vram = float(bench.get("peak_vram_mb", 0.0) or 0.0)
     gpu_memory_gb = float(bench.get("gpu_memory_gb", 0.0) or 0.0)
     if gpu_memory_gb > 0 and peak_vram > gpu_memory_gb * 1024 * 0.8:
         return False, "vram_exceeds_80_percent"
-    if (bench.get("kernel") or {}).get("stable") is False:
-        return False, "timing_unstable"
-    if route_mode and route_allow_regression and route_role != "validation":
-        return True, "architecture_route_regression_allowed_for_followup"
+    if route_mode and route_allow_regression and not route_validation:
+        if route_milestone_status == "failed":
+            return False, f"architecture_route_milestone_failed:{route_milestone or 'unspecified'}"
+        return True, f"architecture_route_{route_milestone or route_role}_kept_for_followup"
+    unstable_reason = _timing_unstable_reason(bench)
+    if unstable_reason:
+        return False, unstable_reason
     current_tp = float(bench.get("throughput_tflops", 0.0) or 0.0)
     parent_tp = _get_parent_throughput(parent_id)
     if parent_tp > 0 and current_tp > 0:
         improvement = (current_tp - parent_tp) / parent_tp * 100
-        if improvement > 1.0:
-            return True, f"improved_{improvement:.2f}_percent"
-        return False, f"improvement_{improvement:.2f}_below_threshold"
+        uncertainty_pct = _timing_uncertainty_pct(bench)
+        required_improvement_pct = max(1.0, uncertainty_pct)
+        if improvement > required_improvement_pct:
+            return True, f"improved_{improvement:.2f}_percent_above_uncertainty_{uncertainty_pct:.2f}"
+        return False, f"improvement_{improvement:.2f}_within_uncertainty_{uncertainty_pct:.2f}_percent"
     return True, "baseline_seed"
 
 
@@ -644,6 +799,7 @@ def _run_preflight(gpu: int, nvcc_bin: str, ncu_bin: str) -> dict[str, Any]:
 
 def run_experiment(
     hypothesis: str,
+    iteration_mode: str,
     quick: bool,
     targeted_ncu: bool,
     full_ncu: bool,
@@ -665,15 +821,39 @@ def run_experiment(
     route_iteration_role: str,
     route_allow_regression: bool,
     route_plan: str | None,
+    route_milestone: str,
+    route_milestone_status: str,
+    route_invariant_satisfied: bool | None,
+    route_old_bottleneck_removed: bool | None,
+    route_stage_metrics: dict[str, Any],
+    route_failure_class: str,
+    route_negative_evidence_scope: str,
+    route_blocks: list[str],
+    route_does_not_block: list[str],
     mark_design_boundary: bool,
     clear_design_boundary: bool,
     design_boundary_reason: str,
     allow_local_after_boundary: bool,
     state_only: bool,
+    bench_warmup: int | None,
+    bench_rep: int | None,
+    bench_trials: int | None,
+    max_bench_trials: int | None,
+    quick_bench_trials: int | None,
+    stability_threshold_pct: float | None,
+    target_ci_pct: float | None,
+    adaptive_trials: bool,
+    paired_benchmark: bool,
 ) -> dict[str, Any]:
     if proposal_template:
         global PROPOSAL_TEMPLATE
         PROPOSAL_TEMPLATE = Path(proposal_template).resolve()
+
+    if iteration_mode not in ITERATION_MODES:
+        return {"status": "error", "reason": f"invalid_iteration_mode:{iteration_mode}"}
+    if architecture_route:
+        iteration_mode = "architecture_route"
+    route_enabled = iteration_mode in ("architecture_discovery", "architecture_route")
 
     if not KERNEL_FILE.exists() and not preflight_only:
         return {"status": "error", "reason": "kernel.py not found"}
@@ -715,7 +895,8 @@ def run_experiment(
         save_global_strategy_memory(STRATEGY_MEMORY_FILE, strategy_payload)
     constraints = merge_strategy_constraints(scope)
     route_metadata: dict[str, Any] = {
-        "enabled": bool(architecture_route),
+        "enabled": bool(route_enabled),
+        "route_type": iteration_mode if route_enabled else "",
         "route_id": "",
         "invariant": route_invariant.strip(),
         "expected_impact": route_expected_impact.strip(),
@@ -724,15 +905,24 @@ def run_experiment(
         "iteration_role": route_iteration_role,
         "allow_regression": bool(route_allow_regression),
         "route_plan": route_plan or "",
+        "milestone": route_milestone,
+        "milestone_status": route_milestone_status,
+        "invariant_satisfied": route_invariant_satisfied,
+        "old_bottleneck_removed": route_old_bottleneck_removed,
+        "stage_metrics": route_stage_metrics,
+        "failure_class": route_failure_class.strip(),
+        "negative_evidence_scope": route_negative_evidence_scope.strip(),
+        "blocks": route_blocks,
+        "does_not_block": route_does_not_block,
     }
-    if architecture_route:
+    if route_enabled:
         invariant_for_id = route_metadata["invariant"] or hypothesis
         route_metadata["route_id"] = route_id.strip() if route_id else build_route_id(kernel_type or "unknown_kernel", invariant_for_id)
         if not route_metadata["budget"]:
             route_metadata["budget"] = 8
 
     design_boundary_active = bool((scope.get("design_boundary") or {}).get("active"))
-    if design_boundary_active and not architecture_route and not allow_local_after_boundary and not state_only:
+    if design_boundary_active and not route_enabled and not allow_local_after_boundary and not state_only:
         return {
             "status": "error",
             "reason": "design_boundary_active_requires_architecture_route",
@@ -749,7 +939,7 @@ def run_experiment(
         }
 
     active_route_ids = set(constraints.get("active_routes") or [])
-    is_new_route = architecture_route and route_metadata.get("route_id") not in active_route_ids
+    is_new_route = route_enabled and route_metadata.get("route_id") not in active_route_ids
     if design_boundary_active and is_new_route:
         route_plan_ok, route_plan_reason = _validate_route_plan(route_plan)
         if not route_plan_ok:
@@ -793,6 +983,7 @@ def run_experiment(
     if dry_run:
         return {
             "status": "dry_run",
+            "iteration_mode": iteration_mode,
             "experiment_id": experiment_id,
             "run_dir": str(run_dir),
             "iter_dir": str(iter_dir),
@@ -803,7 +994,20 @@ def run_experiment(
     _git_commit(f"experiment: {hypothesis}")
     git_sha = _git_sha()
 
-    benchmark_rc, benchmark_result, benchmark_command = _run_bench_to_artifacts(iter_dir, quick=quick, gpu=gpu)
+    benchmark_rc, benchmark_result, benchmark_command = _run_bench_to_artifacts(
+        iter_dir,
+        quick=quick,
+        gpu=gpu,
+        bench_warmup=bench_warmup,
+        bench_rep=bench_rep,
+        bench_trials=bench_trials,
+        max_bench_trials=max_bench_trials,
+        quick_bench_trials=quick_bench_trials,
+        stability_threshold_pct=stability_threshold_pct,
+        target_ci_pct=target_ci_pct,
+        adaptive_trials=adaptive_trials,
+        paired_benchmark=paired_benchmark,
+    )
     quick_validation_reason = ""
     quick_benchmark_result: dict[str, Any] | None = None
     quick_benchmark_command = ""
@@ -828,6 +1032,15 @@ def run_experiment(
                 iter_dir,
                 quick=False,
                 gpu=gpu,
+                bench_warmup=bench_warmup,
+                bench_rep=bench_rep,
+                bench_trials=bench_trials,
+                max_bench_trials=max_bench_trials,
+                quick_bench_trials=quick_bench_trials,
+                stability_threshold_pct=stability_threshold_pct,
+                target_ci_pct=target_ci_pct,
+                adaptive_trials=adaptive_trials,
+                paired_benchmark=paired_benchmark,
             )
     correctness_pass = (benchmark_result.get("correctness") or {}).get("passed") is True
     primary_size = benchmark_result.get("primary_size") or {}
@@ -882,6 +1095,7 @@ def run_experiment(
 
     record: dict[str, Any] = {
         "iteration": iteration,
+        "iteration_mode": iteration_mode,
         "experiment_id": experiment_id,
         "hypothesis": hypothesis,
         "parent_experiment_id": parent_id,
@@ -971,6 +1185,7 @@ def run_experiment(
     return {
         "status": "completed",
         "experiment_id": experiment_id,
+        "iteration_mode": iteration_mode,
         "run_dir": str(run_dir),
         "iter_dir": str(iter_dir),
         "kept": kept,
@@ -982,6 +1197,16 @@ def run_experiment(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Artifact-aware experiment runner for cuda-evolve")
     parser.add_argument("--hypothesis", type=str, required=True)
+    parser.add_argument(
+        "--iteration-mode",
+        type=str,
+        default="local_tune",
+        choices=ITERATION_MODES,
+        help=(
+            "Execution route for this iteration. local_tune requires immediate speedup; "
+            "architecture_discovery/architecture_route use route milestones; external_probe is optional evidence only."
+        ),
+    )
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--targeted-ncu", action="store_true")
     parser.add_argument("--full-ncu", action="store_true")
@@ -1005,6 +1230,27 @@ def main() -> None:
     parser.add_argument("--route-budget", type=int, default=0, help="Maximum focused sub-iterations for this route.")
     parser.add_argument("--route-stop-condition", type=str, default="", help="Evidence-based condition for stopping the route.")
     parser.add_argument("--route-plan", type=str, default="", help="Path to a route portfolio plan with at least two candidate architecture routes.")
+    parser.add_argument("--route-milestone", type=str, default="skeleton", choices=ROUTE_MILESTONES, help="Current route milestone being attempted.")
+    parser.add_argument("--route-milestone-status", type=str, default="pending", choices=ROUTE_MILESTONE_STATUSES, help="Whether this sub-iteration achieved its route milestone.")
+    parser.add_argument(
+        "--route-invariant-satisfied",
+        type=str,
+        default="unknown",
+        choices=["unknown", "yes", "no"],
+        help="Whether the implementation actually satisfies the full route invariant.",
+    )
+    parser.add_argument(
+        "--route-old-bottleneck-removed",
+        type=str,
+        default="unknown",
+        choices=["unknown", "yes", "no"],
+        help="Whether the dominant old dataflow/materialization/repeated-work bottleneck is gone.",
+    )
+    parser.add_argument("--route-stage-metrics-json", type=str, default="", help="JSON object with route-stage timings/cost model evidence.")
+    parser.add_argument("--route-failure-class", type=str, default="", help="Narrow failure class for scoped negative evidence.")
+    parser.add_argument("--route-negative-evidence-scope", type=str, default="", help="Scope blocked if this route sub-iteration fails.")
+    parser.add_argument("--route-blocks", type=str, default="", help="Comma-separated implementation neighborhoods blocked by this evidence.")
+    parser.add_argument("--route-does-not-block", type=str, default="", help="Comma-separated broader routes not blocked by this evidence.")
     parser.add_argument(
         "--route-iteration-role",
         type=str,
@@ -1021,15 +1267,41 @@ def main() -> None:
     parser.add_argument("--clear-design-boundary", action="store_true", help="Clear the design-boundary marker for the current kernel scope.")
     parser.add_argument("--design-boundary-reason", type=str, default="", help="Reason for marking or clearing the design-boundary state.")
     parser.add_argument("--state-only", action="store_true", help="Update strategy-memory state and run metadata without committing or benchmarking.")
+    parser.add_argument("--bench-warmup", type=int, default=None, help="Forwarded to tools/bench.py")
+    parser.add_argument("--bench-rep", type=int, default=None, help="Forwarded to tools/bench.py")
+    parser.add_argument("--bench-trials", type=int, default=None, help="Forwarded to tools/bench.py")
+    parser.add_argument("--max-bench-trials", type=int, default=None, help="Forwarded to tools/bench.py")
+    parser.add_argument("--quick-bench-trials", type=int, default=None, help="Forwarded to tools/bench.py")
+    parser.add_argument("--stability-threshold-pct", type=float, default=None, help="Forwarded to tools/bench.py")
+    parser.add_argument("--target-ci-pct", type=float, default=None, help="Forwarded to tools/bench.py")
+    parser.add_argument("--no-adaptive-trials", action="store_true", help="Disable adaptive paired timing in tools/bench.py")
+    parser.add_argument("--no-paired-benchmark", action="store_true", help="Disable paired kernel/reference timing in tools/bench.py")
     parser.add_argument(
         "--allow-local-after-boundary",
         action="store_true",
         help="Allow a non-route local experiment even while design-boundary mode is active. Requires explicit human-level justification in the hypothesis/proposal.",
     )
     args = parser.parse_args()
+    try:
+        route_stage_metrics = _parse_json_object(args.route_stage_metrics_json, label="route_stage_metrics_json")
+    except ValueError as exc:
+        print(json.dumps({"status": "error", "reason": str(exc)}, indent=2, ensure_ascii=False))
+        sys.exit(1)
+
+    route_invariant_satisfied = {
+        "yes": True,
+        "no": False,
+        "unknown": None,
+    }[args.route_invariant_satisfied]
+    route_old_bottleneck_removed = {
+        "yes": True,
+        "no": False,
+        "unknown": None,
+    }[args.route_old_bottleneck_removed]
 
     result = run_experiment(
         hypothesis=args.hypothesis,
+        iteration_mode=args.iteration_mode,
         quick=args.quick,
         targeted_ncu=args.targeted_ncu,
         full_ncu=args.full_ncu,
@@ -1051,15 +1323,36 @@ def main() -> None:
         route_iteration_role=args.route_iteration_role,
         route_allow_regression=args.route_allow_regression,
         route_plan=args.route_plan,
+        route_milestone=args.route_milestone,
+        route_milestone_status=args.route_milestone_status,
+        route_invariant_satisfied=route_invariant_satisfied,
+        route_old_bottleneck_removed=route_old_bottleneck_removed,
+        route_stage_metrics=route_stage_metrics,
+        route_failure_class=args.route_failure_class,
+        route_negative_evidence_scope=args.route_negative_evidence_scope,
+        route_blocks=_parse_csv_tokens(args.route_blocks),
+        route_does_not_block=_parse_csv_tokens(args.route_does_not_block),
         mark_design_boundary=args.mark_design_boundary,
         clear_design_boundary=args.clear_design_boundary,
         design_boundary_reason=args.design_boundary_reason,
         allow_local_after_boundary=args.allow_local_after_boundary,
         state_only=args.state_only,
+        bench_warmup=args.bench_warmup,
+        bench_rep=args.bench_rep,
+        bench_trials=args.bench_trials,
+        max_bench_trials=args.max_bench_trials,
+        quick_bench_trials=args.quick_bench_trials,
+        stability_threshold_pct=args.stability_threshold_pct,
+        target_ci_pct=args.target_ci_pct,
+        adaptive_trials=not args.no_adaptive_trials,
+        paired_benchmark=not args.no_paired_benchmark,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     if result.get("status") == "completed" and not result.get("kept", False):
         route = result.get("architecture_route") or {}
+        mode = result.get("iteration_mode", "")
+        if mode in ("external_probe", "framework_maintenance"):
+            sys.exit(0)
         if route.get("enabled") and route.get("iteration_role") != "validation":
             sys.exit(0)
         sys.exit(1)

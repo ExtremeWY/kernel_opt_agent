@@ -1,0 +1,33 @@
+[meta]
+multi_output = true
+description = "Qwen3.5 MoE gated delta net prefill, D=128 H_k=16 H_v=32 KDA=false"
+
+test_dtypes = ["float32"]
+
+[[test_sizes]]
+label = "small"
+params = {batch = 1, seq_len = 2048}
+
+[[test_sizes]]
+label = "large"
+params = {batch = 1, seq_len = 4096}
+
+[[test_sizes]]
+label = "xlarge"
+params = {batch = 1, seq_len = 8192}
+
+[[test_sizes]]
+label = "tail_2113"
+params = {batch = 1, seq_len = 2113}
+
+[[test_sizes]]
+label = "tail_4097"
+params = {batch = 1, seq_len = 4097}
+
+[[test_sizes]]
+label = "tail_8191"
+params = {batch = 1, seq_len = 8191}
+
+[tolerances.float32]
+atol = 2e-3
+rtol = 2e-1

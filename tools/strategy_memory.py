@@ -144,13 +144,18 @@ def get_kernel_median_ms(record: dict[str, Any]) -> float | None:
 
 def classify_strategy_outcome(record: dict[str, Any], previous_record: dict[str, Any] | None) -> tuple[str, str]:
     bench = record.get("benchmark_result") or {}
+    iteration_mode = str(record.get("iteration_mode") or "local_tune")
+    if iteration_mode in ("external_probe", "framework_maintenance"):
+        return ("inconclusive", f"{iteration_mode}_evidence_only")
     route = record.get("architecture_route") or {}
     route_mode = bool(route.get("enabled"))
     route_role = str(route.get("iteration_role") or "")
-    route_validation = route_mode and route_role == "validation"
+    route_milestone = str(route.get("milestone") or "")
+    route_validation = route_mode and (route_role == "validation" or route_milestone == "validation")
+    route_invariant_satisfied = route.get("invariant_satisfied") is True
 
     def nonblocking_route(reason: str) -> tuple[str, str]:
-        if route_mode and not route_validation:
+        if route_mode and (not route_validation or not route_invariant_satisfied):
             return ("inconclusive", f"architecture_route_subiteration:{reason}")
         return ("rejected", reason)
 
@@ -179,7 +184,7 @@ def classify_strategy_outcome(record: dict[str, Any], previous_record: dict[str,
         return nonblocking_route("no_previous_median")
     if current_median < previous_median:
         return ("positive", "faster_than_previous")
-    if route_mode and not route_validation:
+    if route_mode and (not route_validation or not route_invariant_satisfied):
         return ("inconclusive", "architecture_route_subiteration:slower_or_equal_to_previous")
     return ("negative", "slower_or_equal_to_previous")
 
@@ -200,11 +205,13 @@ def update_route_state(
     if route is None:
         route = {
             "route_id": route_id,
+            "route_type": route_metadata.get("route_type", "architecture_route"),
             "invariant": route_metadata.get("invariant", ""),
             "expected_impact": route_metadata.get("expected_impact", ""),
             "budget": route_metadata.get("budget", 0),
             "stop_condition": route_metadata.get("stop_condition", ""),
             "route_plan": route_metadata.get("route_plan", ""),
+            "milestones": {},
             "status": "active",
             "created_at": now_iso(),
             "updated_at": "",
@@ -223,22 +230,45 @@ def update_route_state(
         route["stop_condition"] = route_metadata["stop_condition"]
     if route_metadata.get("route_plan"):
         route["route_plan"] = route_metadata["route_plan"]
+    if route_metadata.get("route_type"):
+        route["route_type"] = route_metadata["route_type"]
 
     strategy = record.get("strategy") or {}
+    milestone = str(route_metadata.get("milestone") or "")
+    milestone_status = str(route_metadata.get("milestone_status") or "")
     entry = {
         "iteration": record.get("iteration"),
         "experiment_id": record.get("experiment_id", ""),
         "role": route_metadata.get("iteration_role", ""),
+        "milestone": milestone,
+        "milestone_status": milestone_status,
         "git_sha": record.get("git_sha", ""),
         "kept": bool(record.get("kept")),
         "decision_reason": record.get("decision_reason", ""),
         "strategy_outcome": strategy.get("outcome", ""),
         "strategy_reason": strategy.get("reason", ""),
+        "invariant_satisfied": route_metadata.get("invariant_satisfied"),
+        "old_bottleneck_removed": route_metadata.get("old_bottleneck_removed"),
+        "stage_metrics": route_metadata.get("stage_metrics") or {},
+        "failure_class": route_metadata.get("failure_class", ""),
+        "negative_evidence_scope": route_metadata.get("negative_evidence_scope", ""),
+        "blocks": route_metadata.get("blocks") or [],
+        "does_not_block": route_metadata.get("does_not_block") or [],
         "benchmark_json": record.get("benchmark_json", ""),
         "targeted_report": record.get("targeted_report", ""),
         "full_report": record.get("full_report", ""),
     }
     route.setdefault("subiterations", []).append(entry)
+    if milestone:
+        route.setdefault("milestones", {})[milestone] = {
+            "status": milestone_status,
+            "iteration": record.get("iteration"),
+            "experiment_id": record.get("experiment_id", ""),
+            "updated_at": now_iso(),
+            "stage_metrics": route_metadata.get("stage_metrics") or {},
+            "invariant_satisfied": route_metadata.get("invariant_satisfied"),
+            "old_bottleneck_removed": route_metadata.get("old_bottleneck_removed"),
+        }
     used_budget = len(route.get("subiterations") or [])
     route["used_budget"] = used_budget
 
@@ -246,9 +276,17 @@ def update_route_state(
     reason = strategy.get("reason", "")
     if outcome == "positive" and record.get("kept"):
         route["status"] = "active_positive"
-    elif route_metadata.get("iteration_role") == "validation" and outcome == "negative":
+    elif (
+        (route_metadata.get("iteration_role") == "validation" or route_metadata.get("milestone") == "validation")
+        and route_metadata.get("invariant_satisfied") is True
+        and outcome == "negative"
+    ):
         route["status"] = "negative"
-    elif route_metadata.get("iteration_role") == "validation" and outcome == "positive":
+    elif (
+        (route_metadata.get("iteration_role") == "validation" or route_metadata.get("milestone") == "validation")
+        and route_metadata.get("invariant_satisfied") is True
+        and outcome == "positive"
+    ):
         route["status"] = "validated_positive"
     elif outcome == "inconclusive":
         route["status"] = "active_repair" if used_budget < int(route.get("budget") or 0) else "budget_exhausted"
@@ -288,6 +326,7 @@ def update_memory_bucket(
 ) -> None:
     current_median = get_kernel_median_ms(record)
     previous_median = get_kernel_median_ms(previous_record) if previous_record else None
+    route = record.get("architecture_route") or {}
     item = bucket.get(fingerprint)
     if item is None:
         item = {
@@ -312,6 +351,19 @@ def update_memory_bucket(
         "shape_regime": ((record.get("guidance") or {}).get("shape_regime")),
         "guidance_class": ((record.get("guidance") or {}).get("guidance_class")),
         "kernel_traits": ((record.get("guidance") or {}).get("kernel_traits") or {}),
+        "route": {
+            "enabled": bool(route.get("enabled")),
+            "route_id": route.get("route_id", ""),
+            "route_type": route.get("route_type", ""),
+            "milestone": route.get("milestone", ""),
+            "milestone_status": route.get("milestone_status", ""),
+            "invariant_satisfied": route.get("invariant_satisfied"),
+            "old_bottleneck_removed": route.get("old_bottleneck_removed"),
+            "failure_class": route.get("failure_class", ""),
+            "negative_evidence_scope": route.get("negative_evidence_scope", ""),
+            "blocks": route.get("blocks") or [],
+            "does_not_block": route.get("does_not_block") or [],
+        },
     }
 
 
