@@ -35,6 +35,7 @@ This file should stay compact and navigable. Long-form explanations belong in
 |---|---|---|
 | compute-bound GEMM / tensor-core issues | `docs/compute_optimization.md`, `docs/triton_optimization.md`, `docs/cutlass_optimization.md` | `[tensor-core]`, `[mma-shape]`, `[small-m]`, `[compare-cuda-vs-tc]`, `[tile-size]`, `[data-type]` |
 | memory-bound streaming kernel | `docs/memory_optimization.md`, `docs/stall_reasons.md` | `[memory-coalescing]`, `[vectorized-loads]`, `[cache]` |
+| shared-memory bank conflicts in staged MMA operands | `docs/memory_optimization.md`, `docs/prototype_ladder.md`, `docs/compute_optimization.md` | `[bank-conflict]`, `[layout-primitive]`, `[manual-fragment]`, `[tensor-core]` |
 | low occupancy | `docs/compute_optimization.md`, `docs/triton_optimization.md` | `[occupancy]`, `[register-pressure]`, `[launch-config]` |
 | high register count / spills | `docs/compute_optimization.md`, `docs/triton_optimization.md` | `[register-pressure]`, `[tile-size]` |
 | warp-count / CTA-geometry mismatch | `docs/compute_optimization.md`, `docs/sync_optimization.md` | `[warp-count]`, `[cta-geometry]`, `[launch-config]`, `[sync]` |
@@ -61,6 +62,7 @@ This file should stay compact and navigable. Long-form explanations belong in
 | `cp.async` / software pipelining | `docs/memory_optimization.md`, `docs/sync_optimization.md` | validate both overlap and correctness |
 | TMA / Hopper+ features | `docs/arch_notes.md`, `docs/cutlass_optimization.md`, `docs/triton_optimization.md` | layout and pipeline semantics matter |
 | warp specialization | `docs/compute_optimization.md`, `docs/sync_optimization.md` | often limited by registers and barriers |
+| shared layout swizzle / matrix load primitive | `docs/memory_optimization.md`, `docs/prototype_ladder.md`, `docs/compute_optimization.md` | swizzle storage only with a matching consumer layout, e.g. manual `ldmatrix`/`mma.sync`, manual fragments, or explicit descriptors |
 | swizzle / tile ordering | `docs/memory_optimization.md`, `docs/triton_optimization.md`, `docs/cutlass_optimization.md` | use only when locality justifies it |
 
 ---
@@ -86,6 +88,9 @@ The repository uses short reusable tags in experiment notes and this guide.
 | `[vectorized-loads]` | wide loads / stores and alignment | `docs/memory_optimization.md` |
 | `[cache]` | L1/L2 residency, eviction policy, tile reuse | `docs/memory_optimization.md` |
 | `[memory-access]` | broader address-generation and staging issues | `docs/memory_optimization.md` |
+| `[bank-conflict]` | shared-memory bank conflict diagnosis and fixes | `docs/memory_optimization.md`, `docs/prototype_ladder.md` |
+| `[layout-primitive]` | compatibility between a staged shared layout and the primitive that consumes it, such as WMMA, `ldmatrix`, TMA, or manual fragments | `docs/memory_optimization.md`, `docs/prototype_ladder.md` |
+| `[manual-fragment]` | manually constructing matrix fragments or per-lane operands to avoid fixed-layout shared-memory loaders | `docs/compute_optimization.md`, `docs/memory_optimization.md` |
 | `[warp-divergence]` | branch-heavy or mask-heavy hot paths | `docs/compute_optimization.md` |
 | `[algorithmic]` | work reduction, loop simplification, mathematical restructuring | `docs/compute_optimization.md`, `docs/triton_optimization.md` |
 | `[sync]` | barrier, wait, fence, pipeline protocol | `docs/sync_optimization.md` |
@@ -866,7 +871,78 @@ Patterns below are indexed by **bottleneck type** rather than kernel. When the a
      failed determinism; fixing the synchronization revealed the route was
      strongly positive.
 
+19. **Pair shared-layout swizzle with the matching matrix-load primitive** (`[bank-conflict]` `[layout-primitive]` `[manual-fragment]` `[tensor-core]`)
+   - In `qwen35moe_gdn_prefill`, applying a FlashAttention-style XOR swizzle to
+     the precompute Q/K shared tiles only became valid after replacing the two
+     standard WMMA `K@K^T` / `Q@K^T` loads with hand-written
+     `ldmatrix.sync.aligned.m8n8` plus
+     `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`.
+   - NCU confirmed the mechanism: precompute shared bank conflicts dropped from
+     `7,768,002` to `430,809`. End-to-end timing was noisy and the main kernel
+     was mostly unchanged, so record the result as a confirmed local layout
+     mechanism and directional runtime improvement, not as proof that every
+     WMMA matrix should be swizzled.
+   - Why it works: FlashAttention-style swizzle is a contract between the
+     stored shared layout and the per-lane `ldmatrix` address stream. Standard
+     `wmma::load_matrix_sync` still expects normal row/column-major storage; if
+     that loader remains in place, use padding/leading-dimension fixes instead
+     of XOR-swizzling the underlying matrix.
+   - Execution rule: for bank-conflict proposals on tensor-core kernels, first
+     identify the source/SASS line and the consumer primitive. A swizzle route
+     must either change the consumer to manual `ldmatrix`/`mma.sync`, manual
+     fragment construction, or an explicit descriptor layout, or be rejected as
+     layout-incompatible before implementation.
+
+20. **Use dual layouts only when multiple hot consumers require incompatible primitives** (`[bank-conflict]` `[layout-primitive]` `[shared-memory]` `[dataflow]`)
+   - In `qwen35moe_gdn_prefill`, the main kernel has two K consumers with
+     different layout needs: `K @ S0` benefits from a FlashAttention-style
+     swizzled K tile consumed by manual `ldmatrix`/`mma.sync`, while `K^T @ U`
+     still uses standard WMMA and needs the normal padded `KH_LD=152` layout.
+     The kept route stores both layouts, using a lifetime-aliased swizzled K
+     copy in `upd_s` for `K @ S0` and the normal `khm` tile for `K^T @ U`.
+   - Full benchmark evidence for that route was positive on all six Qwen GDN
+     lengths: `2048=0.5667`, `4096=1.1039`, `8192=2.1302`,
+     `2113=0.5843`, `4097=1.0972`, `8191=2.1092` ms, all faster than the saved
+     TileLang median target.
+   - NCU caveat: aggregate shared bank conflicts rose to `3.52M` even though
+     end-to-end latency improved. A targeted swizzle can improve scheduling or
+     a specific load path while extra stores or other WMMA loads dominate the
+     aggregate counter.
+   - Execution rule: dual-layout shadow tiles are allowed only when the
+     alternative would make one hot consumer layout-incompatible. Use lifetime
+     aliasing when possible, swizzle addresses relative to the shadow buffer's
+     base, and keep only after correctness plus full timing; do not accept it
+     from bank-conflict counters alone.
+
+21. **Prefer direct manual-fragment reads over a swizzled shadow when the padded layout already matches the transposed consumer** (`[layout-primitive]` `[manual-fragment]` `[shared-memory]` `[tensor-core]`)
+   - In `qwen35moe_gdn_prefill`, the later `K^T @ U` route beat the previous
+     swizzled-shadow implementation by reading K directly from the normal padded
+     shared layout (`KH_LD=136`) and manually constructing the
+     `mma.sync.aligned.m16n8k16` A fragment. Pairing this with `M_LD=48` was
+     confirmed by same-process paired benchmarking: six-shape geomean
+     current-best/candidate ratio `1.0161`, minimum ratio `1.0137`.
+   - Why it works: the transposed K consumer only needs the correct per-lane
+     fragment values. If a padded shared layout can supply those values without
+     an intermediate swizzled copy, direct manual fragment construction removes
+     a shared-memory handoff and synchronization point while preserving the
+     primitive's layout contract.
+   - Execution rule: test this only after an isolated fragment mapping proves
+     correctness. It is a consumer-specific route, not a generic replacement
+     for FlashAttention-style swizzles; if another consumer requires an
+     XOR-swizzled address stream, keep the dual-layout rule above.
+
 ### Anti-patterns
+
+- **Blind `cp.async` staging on already synchronized chunk-local tiles** (`[cuda-only]` `[pipeline]` `[cp.async]` `[shared-memory]`)
+  - In `qwen35moe_gdn_prefill`, `pre_cp_k_ca`, `pre_cp_q_ca`,
+    `pre_cp_kq_ca`, `pre_cp_k_cg`, and many combinations with padded/direct
+    K^T consumers failed to beat the current CUDA best. Several larger
+    leading-dim combinations also hit build/resource limits.
+  - Reason: the current precompute/main dataflow is dominated by Tensor Core,
+    shared-memory handoff, and synchronization/resource balance rather than
+    exposed global-load latency that a simple `cp.async` graft can hide. Future
+    async-copy work needs a real multi-stage pipeline invariant before editing,
+    not a one-for-one replacement of existing synchronized loads.
 
 - **Treating old-design partial bypass failures as proof against a full redesign** (`[strategy]` `[dataflow]` `[register-dataflow]`)
   - Several earlier experiments removed only one shared store/read or grafted a
@@ -934,6 +1010,16 @@ Patterns below are indexed by **bottleneck type** rather than kernel. When the a
     WMMA load/codegen/layout cost dominates any conflict reduction. Prefer the
     manual probability fragment dataflow instead of nearby standard-WMMA pitch
     sweeps.
+- **Swizzling shared storage while keeping a fixed-layout WMMA consumer** (`[bank-conflict]` `[layout-primitive]` `[tensor-core]`)
+  - Directly XOR-swizzling a shared matrix consumed by
+    `wmma::load_matrix_sync` is layout-incompatible unless the data is
+    unswizzled or loaded through a matching manual fragment path.
+  - Reason: standard WMMA loaders encode their own row/column-major operand
+    mapping. A swizzle that only changes store indexes can pass on low-coverage
+    side buffers or fail/slow down once the fixed-layout consumer reads it. The
+    correct route is primitive-matched swizzle: change the consumer to manual
+    `ldmatrix`/`mma.sync`, manual fragment construction, or an explicit layout
+    descriptor, then validate with NCU bank-conflict counters and full timing.
 - **K/V pitch or generic shared-memory tuning for the current bank-conflict signal** (`[shared-memory]` `[bank-conflict]`)
   - Source attribution showed K/V full-prefix staging, residual staging, scalar `prob_tile` stores, and `v_tile` WMMA-B loads have actual shared wavefronts equal to ideal or zero excessive wavefronts.
   - Reason: the aggregate `~169.8M` bank-conflict signal is dominated by PV WMMA-A loads of `prob_tile` and WMMA accumulator stores. K/V layout work does not attack the source-attributed bottleneck.

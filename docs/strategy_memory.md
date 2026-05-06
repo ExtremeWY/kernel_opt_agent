@@ -140,6 +140,10 @@ Negative evidence must be scoped to the satisfied stage. For example:
 
 - a layout-padding failure blocks that padding neighborhood, not all layout
   swizzles
+- a direct swizzle failure under a fixed-layout WMMA consumer blocks that
+  incompatible loader/layout pairing, not a route that also changes the consumer
+  to manual `ldmatrix`/`mma.sync`, manual fragments, or an explicit descriptor
+  layout
 - a slower first pipeline blocks that stage-count/resource combination, not all
   overlap routes
 - a primitive graft that leaves the old hot-state materialization in place does

@@ -53,6 +53,41 @@ Quick-reference for GPU memory hierarchy optimization techniques.
 - Restructure access: ensure threads in a warp access different banks
 - Swizzle: `smem[threadIdx.x ^ threadIdx.y]`
 
+### Primitive-Aware Shared Swizzle
+
+Swizzle is a layout change, not just an index trick. Before applying it, name the
+instruction or library primitive that will consume the shared tile.
+
+Rules:
+
+- If a tile is loaded by standard `wmma::load_matrix_sync`, keep the stored tile
+  in the row-major or column-major layout expected by WMMA. Use padding,
+  leading-dimension changes, or a different WMMA tile shape to improve bank
+  behavior.
+- If a tile is XOR-swizzled like a FlashAttention shared operand, the load path
+  must explicitly consume that layout, for example with hand-written
+  `ldmatrix.sync.aligned.*` addresses plus `mma.sync`, manual fragment
+  construction, or a descriptor API that encodes the swizzle.
+- Do not judge a swizzle route from a partial graft that still uses the old
+  loader, duplicates the tile into a shadow buffer, or swizzles only a
+  low-coverage scalar side matrix. That is narrow negative evidence, not proof
+  against a primitive-matched swizzled layout.
+- Pair the change with source/SASS attribution when possible. Aggregate
+  bank-conflict counters can be dominated by a specific WMMA operand load or
+  accumulator store; generic K/V or scratch pitch sweeps are often the wrong
+  target.
+
+Validation:
+
+- correctness across all shape and determinism stages
+- before/after `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum` and
+  `..._st.sum`
+- registers/thread, shared memory per CTA, and occupancy, because a swizzle
+  that removes conflicts can still lose through address arithmetic or resource
+  pressure
+- full or same-process paired timing before treating the metric win as an
+  end-to-end speedup
+
 **Tiling pattern** (for reductions, GEMM):
 1. Load tile from global to shared memory
 2. `__syncthreads()`

@@ -25,7 +25,7 @@ operators.
 | Case study | Version progression | Transferable lesson |
 |---|---|---|
 | SIMT matmul | naive dot -> shared-memory tiling -> thread coarsening -> register tiling -> warp tiling -> vectorized loads / bounds cleanup -> shared layout fix | Establish the hierarchy first: CTA tile, warp tile, thread/register tile. Bounds cleanup and vectorization are late-stage work, not the first route. |
-| Tensor-core matmul | block/warp tile -> async copy -> padding -> swizzled shared layout -> better matrix-load primitive / address arithmetic -> multistage pipeline -> tile-order swizzle | Choose the intended compute primitive and data layout as a route. Shared-memory padding is only one member of a broader layout route; a failed padding variant does not disprove swizzling. |
+| Tensor-core matmul | block/warp tile -> async copy -> padding -> swizzled shared layout -> better matrix-load primitive / address arithmetic -> multistage pipeline -> tile-order swizzle | Choose the intended compute primitive and data layout as a route. Shared-memory padding is only one member of a broader layout route; a failed padding variant does not disprove swizzling. A swizzled operand layout must be paired with a load primitive or descriptor that understands it; standard WMMA loaders generally require padded normal row/column-major layouts. |
 | Reduction | one thread per row -> parallel tree -> thread coarsening -> warp-level reduction -> abstraction comparison -> vectorized loads | First fix algorithmic parallelism and ownership. Then move communication to the narrowest valid scope. Abstractions such as cooperative groups must still be measured. |
 | Softmax | naive, online, split-row variants across very different shapes | Shape regimes decide the architecture route. A route that wins for small batch / huge row may lose for large row batches. Do not generalize from one benchmark shape. |
 | Attention | high-ceiling first version with tensor-core mainloop, register-resident hot intermediates, warp-owned rows -> shared layout swizzle -> pipeline -> wider matrix-load primitive -> schedule refinement | When the operator is known to be dense-dot dominated, the first serious prototype should already target the high-ceiling primitive and register ownership. Do not spend many iterations on a scalar or materialized-intermediate design. |
@@ -79,7 +79,11 @@ Use these gates before moving from architectural exploration to local tuning.
    register/warp/owner-resident design before tuning that handoff.
 4. **Layout gate**: bank conflicts or uncoalesced staged loads must be tied to
    the specific source/SASS lines and primitive layout. Generic padding, pitch,
-   or tile-order sweeps are not enough evidence.
+   or tile-order sweeps are not enough evidence. The route must also state the
+   consumer primitive's layout contract: standard WMMA row/column-major,
+   manually addressed `ldmatrix`/`mma.sync`, manually constructed fragments, TMA
+   descriptor layout, or another explicit mechanism. Do not swizzle storage
+   independently of the load primitive.
 5. **Pipeline gate**: a pipeline route must state stage count, buffer lifetime,
    wait/commit discipline, synchronization scope, and resource budget.
 6. **Shape-regime gate**: a route must state which operator properties are true
@@ -96,6 +100,9 @@ Manual version histories show that nearby failures often do not disprove the
 larger route:
 
 - A failed padding variant does not disprove a swizzled layout route.
+- A failed direct swizzle under a fixed-layout WMMA loader does not disprove a
+  primitive-matched swizzle route using manual `ldmatrix`/`mma.sync` or manual
+  fragment construction.
 - A slower first pipeline does not disprove pipelining if the stage count,
   buffer lifetime, or register/shared-memory budget was wrong.
 - A failed abstraction variant does not disprove the lower-level primitive.

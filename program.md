@@ -89,6 +89,8 @@ For quick iteration (skip numerical stability, determinism, edge cases):
 
 Quick mode is directional evidence only. It benchmarks fewer cases but still emits multi-trial timing stability fields. If timing is unstable, or if the measured improvement/regression is close to the benchmark noise band, run the full benchmark before making a keep/revert decision.
 
+When comparing two custom-kernel CUDA candidates, a saved benchmark JSON is historical evidence only. If the candidate is manually produced outside the main iteration harness, if per-shape results are mixed, or if the delta is within the configured timing stability/noise band, run a same-process paired A/B benchmark against the current best before promotion. Build both CUDA sources in the same Python process, reuse one input set per shape, alternate measurement order per trial, and record candidate/current-best medians, paired ratios, CI, spread, trial count, source paths, and source hashes. Do not promote a CUDA candidate from stale cross-process timing alone.
+
 Read `run.log` and extract the key metrics:
 
 ```bash
@@ -239,6 +241,15 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
     added memory traffic, launch count, and total timing when they reach the
     `stage_benchmark` milestone. End-to-end timing alone is not enough to reject
     an earlier structural milestone.
+20. **Layout/primitive compatibility gate**: for shared-memory bank-conflict or
+    swizzle work, identify the consumer primitive before editing. Standard
+    WMMA/CUTE/CUTLASS/TMA/ldmatrix paths each impose a concrete operand layout.
+    A swizzled shared layout is valid only when the consumer address path is
+    changed to match it, e.g. hand-written `ldmatrix`/`mma.sync`, manual
+    fragment construction, or a descriptor/layout API that explicitly encodes
+    the swizzle. If the consumer remains `wmma::load_matrix_sync` or another
+    standard row/column-major loader, use compatible fixes such as padding or
+    leading-dimension changes instead of XOR-swizzling the stored matrix.
 
 **Rules:**
 - One change per experiment. Do not combine unrelated optimizations.
@@ -250,6 +261,13 @@ Combine the macro analysis (Step 2) and NCU deep analysis (Step 3) to formulate 
 - For boundary-only changes (tail cases, partial tiles, uncommon predicates, rare dtype/shape paths), compute what fraction of the benchmarked dynamic work they cover. If that fraction is small, deprioritize them behind changes that affect the steady-state hot path.
 - Runtime checks for common tile states are allowed when they preserve correctness and performance portability across all supported sizes. Benchmark-only dispatch is not allowed.
 - Do not turn a structural bottleneck into a series of local layout/load/barrier tweaks. If NCU and history indicate the design itself is wrong, the next experiments must change the design boundary.
+- Do not apply generic swizzle indexing to shared matrices consumed by standard
+  WMMA or another fixed-layout primitive. The proposal must state whether the
+  primitive consumes the original layout or a manually controlled swizzled
+  address stream. Validate this class of change with both correctness and NCU
+  before/after shared bank-conflict counters; if bank conflicts fall but runtime
+  is within timing noise, record the metric win as route evidence rather than
+  over-claiming a keepable end-to-end speedup.
 - When pursuing a design-boundary route, keep the route invariant explicit. Examples of route invariants include “remove a materialized intermediate from the hot path,” “change the ownership model so the producer consumes its own result,” or “move the dominant work to the intended hardware pipeline.” Sub-iterations may tune tile shape, resource balance, or synchronization only if they preserve that invariant.
 - Do not classify an architecture route as failed because one intermediate implementation regressed while it still carried the old bottleneck. Record whether the tested version truly removed the dominant intermediate or only partially bypassed it.
 - Do not require an external implementation as a structural oracle. External
@@ -300,6 +318,8 @@ git commit -m "experiment: <brief description of change>"
 | correctness = PASS, full/stable benchmark throughput same or worse | **REVERT**: `git reset --hard HEAD~1` |
 
 If `--quick` and full benchmark disagree, use the full benchmark result. If the delta is within the configured timing stability threshold, treat the experiment as inconclusive and prefer another hypothesis instead of tuning around noise.
+
+For manual CUDA candidates, a full benchmark against the reference does not replace a current-best A/B comparison. If a manually created `.cu` file is being considered for promotion and the margin is near the noise band, run same-process paired benchmarking against the active best across the relevant shapes before the keep/reject decision.
 
 Architecture-route exception:
 
