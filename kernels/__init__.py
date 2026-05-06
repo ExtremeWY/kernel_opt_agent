@@ -21,4 +21,5 @@ AVAILABLE_KERNELS: list[str] = [
     # "rms_norm",
     # "matmul",
     "flash_attention_2",
+    "qwen35moe_gdn_prefill",
 ]
