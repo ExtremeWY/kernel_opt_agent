@@ -84,6 +84,10 @@ __device__ inline uint32_t shared_u32_addr(const void* ptr) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
 }
 
+__device__ inline float stable_decay_ratio_from_log_prefix(const float* g_log_prefix, int row, int col) {
+  return exp2f((g_log_prefix[row] - g_log_prefix[col]) * LOG2E);
+}
+
 template <int STRIDE>
 __device__ inline uint32_t manual_swizzle(uint32_t index) {
   if constexpr (STRIDE == 16) {
@@ -816,7 +820,6 @@ void gdn_bf16tc_kernel(
   char* ws = workspace + ((size_t(seq) * H_V + h) * (D / BLOCK_DV) + blockIdx.z) * bytes_per_head;
 
   bf16_t* qh      = reinterpret_cast<bf16_t*>(ws + TC_QH_OFF);
-  bf16_t* uh      = reinterpret_cast<bf16_t*>(ws + TC_UH_OFF);
 
   float* state_out = final_state + (static_cast<int64_t>(seq) * H_V + h) * D * D;
   const float* state_in = state + (static_cast<int64_t>(seq) * H_V + h) * D * D;
@@ -826,20 +829,22 @@ void gdn_bf16tc_kernel(
   constexpr int KH_LD = 136;
   __shared__ __align__(16) bf16_t kh_s_main[CHUNK * KH_LD];
   __shared__ float g_prefix[CHUNK];
-  __shared__ float g_inv[CHUNK];
+  __shared__ float g_log_prefix[CHUNK];
   __shared__ float g_scaled[CHUNK];
   __shared__ float tail_beta;
   __shared__ float tail_qk;
   constexpr int PH_LD = 40;
   __shared__ __align__(16) bf16_t ph_s[CHUNK * PH_LD];
-  constexpr int M_LD = 48;
+  __shared__ __align__(16) bf16_t uh_s[CHUNK * BLOCK_DV];
+  constexpr int M_LD = 40;
   __shared__ __align__(16) float m_s[CHUNK * M_LD];
-  constexpr int UPD_LD = 40;
+  constexpr int UPD_LD = 32;
   __shared__ __align__(16) float upd_s[D * UPD_LD];
   bf16_t* ph = ph_s;
+  bf16_t* uh = uh_s;
   float* m = m_s;
-  float* upd = upd_s;
   float* base_out = upd_s;
+  float* ratio_s = upd_s + CHUNK * BLOCK_DV;
   bf16_t* sh = state_s;
   bf16_t* khm_swz = reinterpret_cast<bf16_t*>(upd_s);
   bf16_t* khm = kh_s_main;
@@ -864,9 +869,10 @@ void gdn_bf16tc_kernel(
         khm[tid] = __float2bfloat16_rn(k[base_off]);
       }
       if (tid == 0) {
-        const float prefix = g[(static_cast<int64_t>(seq) * tokens + chunk0) * H_V + h];
-        const float gp = exp2f(prefix * LOG2E);
+        const float g_raw = g[(static_cast<int64_t>(seq) * tokens + chunk0) * H_V + h];
+        const float gp = exp2f(g_raw * LOG2E);
         g_prefix[0] = gp;
+        g_log_prefix[0] = g_raw;
         g_scaled[0] = scale * gp;
         tail_beta = beta[(static_cast<int64_t>(seq) * tokens + chunk0) * H_V + h];
       }
@@ -942,7 +948,8 @@ void gdn_bf16tc_kernel(
         *reinterpret_cast<__nv_bfloat162*>(khm_swz + swizzled_bf16_index<D>(row, col2)) = k_bf16;
       }
       if (tid < CHUNK) {
-        float prefix = g[(static_cast<int64_t>(seq) * tokens + chunk0 + tid) * H_V + h];
+        const float g_raw = g[(static_cast<int64_t>(seq) * tokens + chunk0 + tid) * H_V + h];
+        float prefix = g_raw;
         const int lane = tid & 31;
 #pragma unroll
         for (int offset = 1; offset < 32; offset <<= 1) {
@@ -953,7 +960,7 @@ void gdn_bf16tc_kernel(
         }
         const float gp = exp2f(prefix * LOG2E);
         g_prefix[tid] = gp;
-        g_inv[tid] = 1.0f / gp;
+        g_log_prefix[tid] = prefix;
         g_scaled[tid] = scale * gp;
       }
     } else {
@@ -982,10 +989,11 @@ void gdn_bf16tc_kernel(
     }
 
     if (tid < CHUNK) {
-      float prefix = 0.0f;
+      float g_raw = 0.0f;
       if (tid < actual) {
-        prefix = g[(static_cast<int64_t>(seq) * tokens + chunk0 + tid) * H_V + h];
+        g_raw = g[(static_cast<int64_t>(seq) * tokens + chunk0 + tid) * H_V + h];
       }
+      float prefix = g_raw;
       const int lane = tid & 31;
 #pragma unroll
       for (int offset = 1; offset < 32; offset <<= 1) {
@@ -996,7 +1004,7 @@ void gdn_bf16tc_kernel(
       }
       const float gp = exp2f(prefix * LOG2E);
       g_prefix[tid] = gp;
-      g_inv[tid] = 1.0f / gp;
+      g_log_prefix[tid] = prefix;
       g_scaled[tid] = scale * gp;
     }
     }
@@ -1036,30 +1044,21 @@ void gdn_bf16tc_kernel(
     __syncthreads();
 
     // Vd = (A * G_i/G_j * beta_j) @ W.
-    if (actual == CHUNK) {
-      for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
-        const int row = idx / CHUNK;
-        const int col = idx - row * CHUNK;
-        float av = 0.0f;
-        if (col <= row) {
-          const int t = chunk0 + row;
-          av = __bfloat162float(a_solve[((static_cast<int64_t>(seq) * tokens + t) * H_V + h) * CHUNK + col]);
-          av *= g_prefix[row] * g_inv[col];
-        }
-        ph[row * PH_LD + col] = __float2bfloat16_rn(av);
-      }
-    } else {
-    for (int idx = tid; idx < CHUNK * CHUNK; idx += blockDim.x) {
-      const int row = idx / CHUNK;
-      const int col = idx - row * CHUNK;
+    const int lane = tid & 31;
+#pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+      const int row = warp_id + pass * WARPS;
+      const int col = lane;
+      float ratio = 0.0f;
       float av = 0.0f;
       if (row < actual && col <= row) {
+        ratio = stable_decay_ratio_from_log_prefix(g_log_prefix, row, col);
         const int t = chunk0 + row;
         av = __bfloat162float(a_solve[((static_cast<int64_t>(seq) * tokens + t) * H_V + h) * CHUNK + col]);
-        av *= g_prefix[row] * g_inv[col];
+        av *= ratio;
       }
+      ratio_s[row * CHUNK + col] = ratio;
       ph[row * PH_LD + col] = __float2bfloat16_rn(av);
-    }
     }
     __syncthreads();
 
@@ -1095,43 +1094,25 @@ void gdn_bf16tc_kernel(
       *reinterpret_cast<float2*>(base_out + row * BLOCK_DV + col2) = bv;
     }
 
+    const int last_row = actual - 1;
+    const float g_last = actual == CHUNK ? g_prefix[CHUNK - 1] : (actual > 0 ? g_prefix[last_row] : 1.0f);
+
     // P = tril(scale * G_i/G_j * QK_ij), with QK precomputed once per K head/chunk.
-    if (actual == CHUNK) {
-      for (int idx = tid; idx < CHUNK * (CHUNK / 2); idx += blockDim.x) {
-        const int row = idx / (CHUNK / 2);
-        const int col2 = (idx - row * (CHUNK / 2)) * 2;
-        float p0 = 0.0f;
-        float p1 = 0.0f;
-        if (col2 <= row) {
-          const __nv_bfloat162 qkv =
-              *reinterpret_cast<const __nv_bfloat162*>(qk_cache + qk_cache_off + row * CHUNK + col2);
-          const float2 qkf = __bfloat1622float2(qkv);
-          const float gs = g_scaled[row];
-          p0 = gs * g_inv[col2] * qkf.x;
-          if (col2 + 1 <= row) {
-            p1 = gs * g_inv[col2 + 1] * qkf.y;
-          }
-        }
-        *reinterpret_cast<__nv_bfloat162*>(ph + row * PH_LD + col2) = __floats2bfloat162_rn(p0, p1);
+#pragma unroll
+    for (int pass = 0; pass < 2; ++pass) {
+      const int row = warp_id + pass * WARPS;
+      const int col = lane;
+      float p = 0.0f;
+      float ratio = 0.0f;
+      if (row < actual && col <= row) {
+        ratio = ratio_s[row * CHUNK + col];
+        p = scale * ratio *
+            __bfloat162float(qk_cache[qk_cache_off + static_cast<size_t>(row) * CHUNK + col]);
       }
-    } else {
-    for (int idx = tid; idx < CHUNK * (CHUNK / 2); idx += blockDim.x) {
-      const int row = idx / (CHUNK / 2);
-      const int col2 = (idx - row * (CHUNK / 2)) * 2;
-      float p0 = 0.0f;
-      float p1 = 0.0f;
-      if (row < actual && col2 <= row) {
-        const __nv_bfloat162 qkv =
-            *reinterpret_cast<const __nv_bfloat162*>(qk_cache + qk_cache_off + row * CHUNK + col2);
-        const float2 qkf = __bfloat1622float2(qkv);
-        const float gs = g_scaled[row];
-        p0 = gs * g_inv[col2] * qkf.x;
-        if (col2 + 1 <= row) {
-          p1 = gs * g_inv[col2 + 1] * qkf.y;
-        }
+      ph[row * PH_LD + col] = __float2bfloat16_rn(p);
+      if (row == last_row) {
+        g_prefix[col] = col <= row ? ratio : 0.0f;
       }
-      *reinterpret_cast<__nv_bfloat162*>(ph + row * PH_LD + col2) = __floats2bfloat162_rn(p0, p1);
-    }
     }
     __syncthreads();
 
@@ -1148,20 +1129,21 @@ void gdn_bf16tc_kernel(
     }
 
     // S = G_last*S0 + K_restored^T @ U.
-    const float g_last = actual == CHUNK ? g_prefix[CHUNK - 1] : (actual > 0 ? g_prefix[actual - 1] : 1.0f);
     if (actual == CHUNK) {
       for (int idx = tid; idx < CHUNK * BLOCK_DV; idx += blockDim.x) {
         const int row = idx / BLOCK_DV;
         const int col = idx - row * BLOCK_DV;
         const float vd = __bfloat162float(uh[idx]);
-        ph[row * BLOCK_DV + col] = __float2bfloat16_rn((g_last * g_inv[row]) * vd);
+        const float gd = g_prefix[row];
+        ph[row * BLOCK_DV + col] = __float2bfloat16_rn(gd * vd);
       }
     } else {
       for (int idx = tid; idx < CHUNK * BLOCK_DV; idx += blockDim.x) {
         const int row = idx / BLOCK_DV;
         const int col = idx - row * BLOCK_DV;
         const float vd = row < actual ? __bfloat162float(uh[idx]) : 0.0f;
-        ph[row * BLOCK_DV + col] = __float2bfloat16_rn(row < actual ? (g_last * g_inv[row]) * vd : 0.0f);
+        const float gd = row < actual ? g_prefix[row] : 0.0f;
+        ph[row * BLOCK_DV + col] = __float2bfloat16_rn(gd * vd);
       }
     }
     __syncthreads();
