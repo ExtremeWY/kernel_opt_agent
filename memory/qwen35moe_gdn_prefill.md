@@ -1,5 +1,51 @@
 # qwen35moe_gdn_prefill
 
+## 2026-05-07 FlashQLA-Style FP32 Ratio Role Split 100-Round Iteration
+
+- User constraint for this pass: keep the decay ratio in `float`; do not change
+  ratio dtype to BF16, and do not spend the 100 rounds on ratio-only variants.
+- Completed `workspace/rolesplit_iter_broad100`: 100 generated candidates,
+  98 correctness-passing quick runs, 2 failed reload-swizzle variants. The
+  sweep covered Q residency (`global/shared/reload_swz`), ratio placement
+  (`upd_s` vs `m_s` tail), U/Vd handoff (`global` vs shared), shared leading
+  dimensions, and launch bounds.
+- Promoted candidate 45:
+  `global Q`, FP32 `ratio_s` in the `upd_s` tail, shared `U/Vd` handoff,
+  `M_LD=40`, `UPD_LD=32`, `STATE_LD=40`, `KH_LD=136`, `PH_LD=40`,
+  `launch_bounds(THREADS,2)`. Source SHA256:
+  `328173ff66a502fba81eedf394f75ac4859f6d82174590cd567c8f1921e82816`.
+- Numeric-stability symptom and fix: Qwen model-like gates are often strongly
+  negative, so the old `g_prefix[i] * (1 / g_prefix[j])` form can underflow
+  `g_prefix[j]` to zero, produce `1/0 = inf`, and then inject `0 * inf -> NaN`
+  into diagonal ratios, `Vd`, `P @ U`, and final-state updates. The promoted
+  kernel stores the chunk-local gate prefix in log-domain and computes the
+  decay ratio as FP32 `exp(g_log_prefix[i] - g_log_prefix[j])`; that FP32
+  `ratio_s` is precomputed once in shared memory and reused by both `Vd` and
+  `P` construction. This matches FlashQLA's stable ratio design and avoids the
+  unstable reciprocal path.
+- Full benchmark `workspace/rolesplit_best45_full.json` correctness PASS:
+  shape sweep PASS (`worst_err=8.20e-04`), numerical stability PASS,
+  determinism PASS. Medians:
+  `2048=0.501151`, `4096=0.972057`, `8192=1.869254`,
+  `2113=0.525340`, `4097=0.976963`, `8191=1.870062` ms.
+  These are `6.38-7.93%` faster than the previous target medians
+  (`0.544275/1.045169/2.021053/0.561139/1.049865/2.031025` ms).
+- Same-process paired A/B against the 100-round start source
+  (`workspace/rolesplit_start_kernel.cu`) used shared inputs per shape and
+  alternating order. Artifact: `workspace/rolesplit_best45_ab.json`.
+  Candidate was faster on all six shapes; geomean start/candidate ratio
+  `1.03362`, minimum per-shape ratio `1.02748`. Outputs matched the start
+  source exactly for the tested inputs (`max_abs=0`).
+- Additional model-like single-operator regression with `T=64`,
+  `g ~ uniform(-25,-8)`, and random `q/k/v/beta/state` compared the promoted
+  kernel against the CUDA scalar reference: output finite with
+  `max_abs=9.13e-09`, final state finite with `max_abs=9.91e-07`.
+- Negative evidence: `launch_bounds(...,1)` remained consistently slow;
+  Q shared and Q reload-swizzle routes were slower, and two reload-swizzle +
+  shared-U variants failed correctness. `m_tail` ratio placement did not beat
+  FP32 `ratio_s` in `upd_s`. The useful role split is shared U/Vd handoff plus
+  reduced `M_LD/UPD_LD`, not a ratio dtype or ratio-only change.
+
 ## 2026-05-06 CUDA-only Stop-150 Closure
 
 - Continued CUDA-only optimization from the promoted K^T manual-swizzle source
